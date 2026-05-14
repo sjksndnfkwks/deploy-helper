@@ -1,0 +1,66 @@
+#!/usr/bin/env node
+import { program } from 'commander';
+import chalk from 'chalk';
+import { deployInit } from './commands/init.js';
+import { deployUpdate, manageServers } from './commands/update.js';
+import { deployStatus } from './commands/status.js';
+import { deployRollback } from './commands/rollback.js';
+import { deployEnv } from './commands/env.js';
+import { deployBackup } from './commands/backup.js';
+
+console.log(chalk.cyan.bold('\n🚀 deploy-helper') + chalk.gray(' v0.2.0 — 把项目部署到服务器，就这么简单\n'));
+
+program
+  .name('deploy-helper')
+  .description('交互式部署工具，帮你把项目从本地跑到任意 VPS 服务器上')
+  .version('0.2.0');
+
+program
+  .command('init')
+  .description('首次部署：引导你完成全套配置')
+  .action(deployInit);
+
+program
+  .command('update')
+  .description('更新部署：推送最新代码并重启（支持多服务器）')
+  .action(deployUpdate);
+
+program
+  .command('status')
+  .description('查看服务运行状态、内存占用、最近日志')
+  .action(deployStatus);
+
+program
+  .command('rollback')
+  .description('版本回滚：从历史快照中选择一个版本还原')
+  .action(deployRollback);
+
+program
+  .command('env')
+  .description('环境变量管理：上传/下载/对比 .env 文件')
+  .action(deployEnv);
+
+program
+  .command('backup')
+  .description('数据库备份：MySQL / PostgreSQL / MongoDB，支持定时任务')
+  .action(deployBackup);
+
+program
+  .command('servers')
+  .description('服务器管理：查看、添加、删除多台服务器')
+  .action(manageServers);
+
+// 无命令时显示帮助 + 进入 init
+if (process.argv.length === 2) {
+  console.log(chalk.bold('可用命令：\n'));
+  console.log(`  ${chalk.cyan('init')}      首次部署，全程引导`);
+  console.log(`  ${chalk.cyan('update')}    推送新代码到服务器（支持多台）`);
+  console.log(`  ${chalk.cyan('rollback')}  回滚到历史版本`);
+  console.log(`  ${chalk.cyan('env')}       管理 .env 环境变量`);
+  console.log(`  ${chalk.cyan('backup')}    数据库备份`);
+  console.log(`  ${chalk.cyan('servers')}   管理多台服务器`);
+  console.log(`  ${chalk.cyan('status')}    查看运行状态\n`);
+  console.log(chalk.gray('首次使用？运行：') + chalk.cyan(' deploy-helper init\n'));
+} else {
+  program.parse();
+}
