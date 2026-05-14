@@ -29,9 +29,16 @@ export function getSetupCommands(config) {
   }
 
   if (projectType === 'python') {
+    const pyBin = `python${pythonVersion}`;
     steps.push({
-      label: '安装 Python & pip',
-      cmd: `apt-get install -y -qq python3 python3-pip python3-venv`,
+      label: `安装 Python ${pythonVersion}`,
+      // deadsnakes PPA 支持指定版本；system python3 作为 fallback
+      cmd: [
+        'apt-get install -y -qq software-properties-common',
+        'add-apt-repository -y ppa:deadsnakes/ppa',
+        'apt-get update -qq',
+        `apt-get install -y -qq ${pyBin} ${pyBin}-venv ${pyBin}-distutils || apt-get install -y -qq python3 python3-venv`,
+      ].join(' && '),
     });
     steps.push({
       label: '安装 supervisor（进程管理）',
@@ -55,20 +62,64 @@ export function getSetupCommands(config) {
 
 // 启动/重启应用的命令
 export function getStartCommands(config) {
-  const { projectType, remotePath, startCmd, appName, port } = config;
+  const { projectType, remotePath, startCmd, appName, port, pythonVersion = '3.11', pythonFramework } = config;
 
   if (projectType === 'nodejs') {
-    return [
+    const isNpmCmd = /^npm\s/.test(startCmd);
+    const pm2Target = isNpmCmd
+      ? `npm --name ${appName} -- ${startCmd.replace(/^npm\s+/, '')}`
+      : `${remotePath}/.start.sh --name ${appName} --interpreter bash`;
+
+    const steps = [
       { label: '安装依赖', cmd: `cd ${remotePath} && npm install --production` },
-      { label: '启动应用（PM2）', cmd: `cd ${remotePath} && pm2 delete ${appName} 2>/dev/null; pm2 start ${startCmd} --name ${appName}` },
-      { label: '设置 PM2 开机自启', cmd: `pm2 save && pm2 startup | tail -1 | bash || true` },
     ];
+
+    if (!isNpmCmd) {
+      steps.push({
+        label: '写入启动脚本',
+        cmd: `printf '#!/bin/bash\\ncd ${remotePath}\\n${startCmd}\\n' > ${remotePath}/.start.sh && chmod +x ${remotePath}/.start.sh`,
+      });
+    }
+
+    steps.push(
+      { label: '启动应用（PM2）', cmd: `pm2 delete ${appName} 2>/dev/null || true && pm2 start ${pm2Target}` },
+      { label: '设置 PM2 开机自启', cmd: `pm2 save && pm2 startup | tail -1 | bash || true` },
+    );
+
+    return steps;
   }
 
   if (projectType === 'python') {
+    const pyBin = `python${pythonVersion}`;
+    const venvPip = `${remotePath}/venv/bin/pip`;
+    // 将 startCmd 的第一个词替换为 venv 内的可执行文件路径
+    const venvCmd = startCmd.replace(/^(\S+)/, `${remotePath}/venv/bin/$1`);
+
+    const extraPkg = pythonFramework === 'fastapi' ? 'uvicorn' : 'gunicorn';
+    const supervisorConf = getSupervisorConfig({ appName, remotePath, venvCmd });
+    const supervisorConfPath = `/etc/supervisor/conf.d/${appName}.conf`;
+
     return [
-      { label: '安装 Python 依赖', cmd: `cd ${remotePath} && pip3 install -r requirements.txt -q` },
-      { label: '启动应用（supervisor）', cmd: `cd ${remotePath} && supervisorctl reread && supervisorctl update && supervisorctl restart ${appName}` },
+      {
+        label: '创建 Python 虚拟环境',
+        cmd: `${pyBin} -m venv ${remotePath}/venv || python3 -m venv ${remotePath}/venv`,
+      },
+      {
+        label: '安装 Python 依赖',
+        cmd: `cd ${remotePath} && ${venvPip} install -r requirements.txt -q`,
+      },
+      {
+        label: `安装 ${extraPkg}（WSGI/ASGI 服务器）`,
+        cmd: `${venvPip} install ${extraPkg} -q`,
+      },
+      {
+        label: '写入 supervisor 配置',
+        cmd: `printf '${supervisorConf.replace(/'/g, "'\\''")}' > ${supervisorConfPath}`,
+      },
+      {
+        label: '启动应用（supervisor）',
+        cmd: `supervisorctl reread && supervisorctl update && (supervisorctl restart ${appName} 2>/dev/null || supervisorctl start ${appName})`,
+      },
     ];
   }
 
@@ -85,6 +136,20 @@ export function getStartCommands(config) {
   }
 
   return [];
+}
+
+// 生成 supervisor 配置内容
+function getSupervisorConfig({ appName, remotePath, venvCmd }) {
+  return [
+    `[program:${appName}]`,
+    `command=${venvCmd}`,
+    `directory=${remotePath}`,
+    `autostart=true`,
+    `autorestart=true`,
+    `stderr_logfile=/var/log/${appName}.err.log`,
+    `stdout_logfile=/var/log/${appName}.out.log`,
+    ``,
+  ].join('\\n');
 }
 
 // 生成 Nginx 配置

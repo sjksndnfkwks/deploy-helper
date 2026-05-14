@@ -6,10 +6,9 @@ export function detectProjectType(projectPath = process.cwd()) {
 
   if (files.includes('package.json')) {
     const pkg = JSON.parse(fs.readFileSync(path.join(projectPath, 'package.json'), 'utf-8'));
-    // 判断是否是纯前端项目
     const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-    if (deps['next'] || deps['nuxt']) return 'nodejs'; // SSR 框架当后端处理
-    if (pkg.scripts?.build && !pkg.scripts?.start) return 'static'; // 只有 build 没有 start
+    if (deps['next'] || deps['nuxt']) return 'nodejs';
+    if (pkg.scripts?.build && !pkg.scripts?.start) return 'static';
     return 'nodejs';
   }
 
@@ -28,6 +27,93 @@ export function detectProjectType(projectPath = process.cwd()) {
   return 'unknown';
 }
 
+// 从 .nvmrc / .node-version / package.json engines.node 读取主版本号
+export function detectNodeVersion(projectPath = process.cwd()) {
+  for (const file of ['.nvmrc', '.node-version']) {
+    const p = path.join(projectPath, file);
+    if (fs.existsSync(p)) {
+      const raw = fs.readFileSync(p, 'utf-8').trim().replace(/^v/, '');
+      const major = parseInt(raw);
+      if (!isNaN(major)) return { version: String(major), source: file };
+    }
+  }
+
+  const pkgPath = path.join(projectPath, 'package.json');
+  if (fs.existsSync(pkgPath)) {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+    if (pkg.engines?.node) {
+      const match = pkg.engines.node.match(/(\d+)/);
+      if (match) return { version: match[1], source: 'package.json engines.node' };
+    }
+  }
+
+  return null;
+}
+
+// 从 requirements.txt 检测 Python 框架
+export function detectPythonFramework(projectPath = process.cwd()) {
+  const reqPath = path.join(projectPath, 'requirements.txt');
+  if (!fs.existsSync(reqPath)) return null;
+
+  const content = fs.readFileSync(reqPath, 'utf-8').toLowerCase();
+  // 按优先级检测，fastapi 优先（flask 是 fastapi 的间接依赖有时也会出现）
+  if (content.match(/^fastapi[>=\[<\s]/m) || content.includes('\nfastapi')) return 'fastapi';
+  if (content.match(/^django[>=\[<\s]/m) || content.includes('\ndjango')) return 'django';
+  if (content.match(/^flask[>=\[<\s]/m) || content.includes('\nflask')) return 'flask';
+  return null;
+}
+
+// 从 .python-version 或 pyproject.toml 读取 Python 版本
+export function detectPythonVersion(projectPath = process.cwd()) {
+  const pyVersionPath = path.join(projectPath, '.python-version');
+  if (fs.existsSync(pyVersionPath)) {
+    const raw = fs.readFileSync(pyVersionPath, 'utf-8').trim();
+    const match = raw.match(/^(\d+\.\d+)/);
+    if (match) return { version: match[1], source: '.python-version' };
+  }
+
+  const pyprojectPath = path.join(projectPath, 'pyproject.toml');
+  if (fs.existsSync(pyprojectPath)) {
+    const content = fs.readFileSync(pyprojectPath, 'utf-8');
+    const match = content.match(/python\s*=\s*["'][^"']*?(\d+\.\d+)/);
+    if (match) return { version: match[1], source: 'pyproject.toml' };
+  }
+
+  return null;
+}
+
+// 读取 package.json scripts.start，或扫描常见入口文件
+export function getNodeStartCommand(projectPath = process.cwd()) {
+  const pkgPath = path.join(projectPath, 'package.json');
+  if (fs.existsSync(pkgPath)) {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+
+    if (pkg.scripts?.start) {
+      return { cmd: pkg.scripts.start, source: 'package.json scripts.start' };
+    }
+
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+    if (deps['next']) return { cmd: 'next start', source: 'next.js 依赖' };
+    if (deps['nuxt']) return { cmd: 'nuxt start', source: 'nuxt.js 依赖' };
+  }
+
+  for (const file of ['index.js', 'app.js', 'server.js', 'main.js']) {
+    if (fs.existsSync(path.join(projectPath, file))) {
+      return { cmd: `node ${file}`, source: `检测到入口文件 ${file}` };
+    }
+  }
+
+  return { cmd: 'node index.js', source: '默认值' };
+}
+
+// 根据框架生成 Python 启动命令
+export function getPythonStartCommand(framework, appName, port) {
+  if (framework === 'fastapi') return `uvicorn main:app --host 0.0.0.0 --port ${port}`;
+  if (framework === 'django') return `gunicorn ${appName}.wsgi:application --bind 0.0.0.0:${port}`;
+  if (framework === 'flask') return `gunicorn app:app --bind 0.0.0.0:${port}`;
+  return 'python app.py';
+}
+
 export const PROJECT_TYPE_LABELS = {
   nodejs: 'Node.js 应用（Express / Koa / Next.js 等）',
   python: 'Python 应用（Flask / FastAPI / Django 等）',
@@ -36,13 +122,9 @@ export const PROJECT_TYPE_LABELS = {
   unknown: '其他 / 我来手动指定',
 };
 
-// 根据项目类型返回启动命令建议
-export function getStartCommand(type, pkg) {
-  if (type === 'nodejs') {
-    if (pkg?.scripts?.start) return pkg.scripts.start;
-    return 'node index.js';
-  }
-  if (type === 'python') return 'python app.py';
-  if (type === 'docker') return 'docker-compose up -d';
-  return '';
-}
+export const PYTHON_FRAMEWORK_LABELS = {
+  fastapi: 'FastAPI',
+  django: 'Django',
+  flask: 'Flask',
+  other: '其他',
+};

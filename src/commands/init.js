@@ -5,7 +5,11 @@ import path from 'path';
 import os from 'os';
 import { connectSSH, runRemote, runRemoteSilent, uploadDirectory } from '../utils/ssh.js';
 import { saveConfig, loadConfig, configExists } from '../utils/config.js';
-import { detectProjectType, PROJECT_TYPE_LABELS, getStartCommand } from '../utils/detect.js';
+import {
+  detectProjectType, detectNodeVersion, detectPythonFramework, detectPythonVersion,
+  getNodeStartCommand, getPythonStartCommand,
+  PROJECT_TYPE_LABELS, PYTHON_FRAMEWORK_LABELS,
+} from '../utils/detect.js';
 import { getSetupCommands, getStartCommands, getNginxConfig } from '../utils/setup.js';
 
 const step = (n, total, msg) =>
@@ -100,7 +104,8 @@ export async function deployInit() {
   const detectedType = detectProjectType();
   info(`自动检测到项目类型：${PROJECT_TYPE_LABELS[detectedType]}`);
 
-  const projectAnswers = await inquirer.prompt([
+  // 第一步：确认类型和应用名
+  const typeAnswers = await inquirer.prompt([
     {
       type: 'list',
       name: 'projectType',
@@ -115,27 +120,102 @@ export async function deployInit() {
       default: path.basename(process.cwd()),
       validate: (v) => /^[a-z0-9_-]+$/i.test(v) ? true : '只能包含字母、数字、下划线和连字符',
     },
+  ]);
+
+  const { projectType, appName } = typeAnswers;
+
+  // 根据确认的类型做二次检测，结果全部展示给用户
+  let detectedNodeVer = null;
+  let detectedNodeCmd = null;
+  let detectedPyFramework = null;
+  let detectedPyVersion = null;
+
+  if (projectType === 'nodejs') {
+    detectedNodeVer = detectNodeVersion();
+    detectedNodeCmd = getNodeStartCommand();
+
+    if (detectedNodeVer) {
+      info(`检测到 Node.js 版本要求：v${detectedNodeVer.version}（来源：${detectedNodeVer.source}）`);
+    } else {
+      info('未检测到 Node.js 版本要求（.nvmrc / engines.node），将默认使用 Node.js 20 LTS');
+    }
+    info(`检测到启动命令：${detectedNodeCmd.cmd}（来源：${detectedNodeCmd.source}）`);
+  }
+
+  if (projectType === 'python') {
+    detectedPyFramework = detectPythonFramework();
+    detectedPyVersion = detectPythonVersion();
+
+    if (detectedPyFramework) {
+      info(`检测到 Python 框架：${PYTHON_FRAMEWORK_LABELS[detectedPyFramework]}（来源：requirements.txt）`);
+    } else {
+      info('未在 requirements.txt 中检测到已知框架（FastAPI / Django / Flask），请手动确认启动命令');
+    }
+    if (detectedPyVersion) {
+      info(`检测到 Python 版本：${detectedPyVersion.version}（来源：${detectedPyVersion.source}）`);
+    } else {
+      info('未检测到 Python 版本要求（.python-version / pyproject.toml），将默认使用 3.11');
+    }
+  }
+
+  // 第二步：让用户确认所有检测结果，port 在 startCmd 之前以便生成默认命令
+  const detailAnswers = await inquirer.prompt([
     {
       type: 'input',
       name: 'remotePath',
       message: '部署到服务器的路径：',
-      default: (a) => `/var/www/${a.appName}`,
+      default: `/var/www/${appName}`,
     },
     {
       type: 'input',
-      name: 'startCmd',
-      message: '启动命令：',
-      default: 'node index.js',
-      when: (a) => ['nodejs', 'python'].includes(a.projectType),
+      name: 'nodeVersion',
+      message: '确认 Node.js 版本（主版本号，如 18 / 20 / 22）：',
+      default: detectedNodeVer?.version || '20',
+      when: () => projectType === 'nodejs',
+    },
+    {
+      type: 'list',
+      name: 'pythonFramework',
+      message: '确认 Python 框架：',
+      default: detectedPyFramework || 'other',
+      choices: [
+        { name: 'FastAPI（uvicorn 启动）', value: 'fastapi' },
+        { name: 'Django（gunicorn 启动）', value: 'django' },
+        { name: 'Flask（gunicorn 启动）', value: 'flask' },
+        { name: '其他（手动填写启动命令）', value: 'other' },
+      ],
+      when: () => projectType === 'python',
+    },
+    {
+      type: 'input',
+      name: 'pythonVersion',
+      message: '确认 Python 版本（如 3.11）：',
+      default: detectedPyVersion?.version || '3.11',
+      when: () => projectType === 'python',
     },
     {
       type: 'input',
       name: 'port',
       message: '应用监听的端口：',
-      default: '3000',
-      when: (a) => ['nodejs', 'python', 'docker'].includes(a.projectType),
+      default: () => projectType === 'python' ? '8000' : '3000',
+      when: () => ['nodejs', 'python', 'docker'].includes(projectType),
+    },
+    {
+      type: 'input',
+      name: 'startCmd',
+      message: '确认启动命令：',
+      default: (a) => {
+        if (projectType === 'nodejs') return detectedNodeCmd.cmd;
+        if (projectType === 'python') {
+          return getPythonStartCommand(a.pythonFramework, appName, a.port);
+        }
+        return '';
+      },
+      when: () => ['nodejs', 'python'].includes(projectType),
     },
   ]);
+
+  const projectAnswers = { ...typeAnswers, ...detailAnswers };
 
   // ── Step 3: 域名 & HTTPS ──────────────────────────────────────
   step(3, 5, '域名 & HTTPS（可选）');
