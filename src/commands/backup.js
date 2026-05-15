@@ -2,26 +2,29 @@ import chalk from 'chalk';
 import ora from 'ora';
 import inquirer from 'inquirer';
 import path from 'path';
-import fs from 'fs';
 import { connectSSH, runRemoteSilent } from '../utils/ssh.js';
 import { loadConfig, saveConfig } from '../utils/config.js';
 
 const BACKUP_BASE = '/var/deploy-helper/db-backups';
 
 /**
- * 根据数据库类型生成备份命令
+ * 根据数据库类型生成备份命令。
+ * passwordEnvInline=true：把密码以 ENV='xxx' 形式内联（仅用于一次性命令，命令一执行完进程就退出）
+ * passwordEnvInline=false：用 cron 脚本里 source 的 credentials 文件（推荐）
  */
-function buildDumpCommand(dbConfig, outputFile) {
+function buildDumpCommand(dbConfig, outputFile, passwordEnvInline = true) {
   const { type, host, port, user, password, database } = dbConfig;
   const h = host || '127.0.0.1';
 
   if (type === 'mysql') {
     const p = port || 3306;
-    return `MYSQL_PWD='${password}' mysqldump -h ${h} -P ${p} -u ${user} ${database} > ${outputFile}`;
+    const pwd = passwordEnvInline ? `MYSQL_PWD='${password}' ` : '';
+    return `${pwd}mysqldump -h ${h} -P ${p} -u ${user} ${database} > ${outputFile}`;
   }
   if (type === 'postgresql') {
     const p = port || 5432;
-    return `PGPASSWORD='${password}' pg_dump -h ${h} -p ${p} -U ${user} ${database} > ${outputFile}`;
+    const pwd = passwordEnvInline ? `PGPASSWORD='${password}' ` : '';
+    return `${pwd}pg_dump -h ${h} -p ${p} -U ${user} ${database} > ${outputFile}`;
   }
   if (type === 'mongodb') {
     const p = port || 27017;
@@ -126,14 +129,14 @@ async function doBackup(config, silent = false) {
 
     await runRemoteSilent(ssh, `mkdir -p ${backupDir}`);
 
-    // 生成备份
+    // 生成备份（一次性命令：内联密码 OK，进程退出即消失）
     const dumpSpinner = ora(`备份 ${dbConfig.type} 数据库 [${dbConfig.database}]...`).start();
-    const dumpCmd = buildDumpCommand(dbConfig, dbConfig.type === 'mongodb' ? outputFile : rawFile);
+    const dumpCmd = buildDumpCommand(dbConfig, dbConfig.type === 'mongodb' ? outputFile : rawFile, true);
     const dumpResult = await runRemoteSilent(ssh, dumpCmd);
 
     if (dumpResult.code !== 0) {
       dumpSpinner.fail('备份失败');
-      console.log(chalk.red(dumpResult.stdout));
+      console.log(chalk.red(dumpResult.stderr || dumpResult.stdout));
       ssh.dispose();
       return null;
     }
@@ -277,30 +280,66 @@ async function scheduleBackup(config) {
     const backupDir = `${BACKUP_BASE}/${config.appName}`;
     const ext = dbConfig.type === 'mongodb' ? '.archive.gz' : '.sql.gz';
 
-    // 生成备份脚本
+    // 凭据文件单独存放，权限 600；脚本通过 . credentials.sh 加载
+    const credPath = `/etc/deploy-helper/${config.appName}.creds`;
+    const credContent = (() => {
+      if (dbConfig.type === 'mysql') return `export MYSQL_PWD='${dbConfig.password}'\n`;
+      if (dbConfig.type === 'postgresql') return `export PGPASSWORD='${dbConfig.password}'\n`;
+      if (dbConfig.type === 'mongodb') return `export DH_MONGO_USER='${dbConfig.user}'\nexport DH_MONGO_PWD='${dbConfig.password}'\n`;
+      return '';
+    })();
+
+    await runRemoteSilent(ssh, `mkdir -p /etc/deploy-helper && chmod 700 /etc/deploy-helper`);
+    await runRemoteSilent(ssh, `cat > ${credPath} <<'DH_CRED_EOF'\n${credContent}DH_CRED_EOF`);
+    await runRemoteSilent(ssh, `chmod 600 ${credPath}`);
+
+    // 生成备份命令（不内联密码，从 cred 文件加载）
+    const dumpForScript = (() => {
+      const h = dbConfig.host || '127.0.0.1';
+      if (dbConfig.type === 'mysql') {
+        return `mysqldump -h ${h} -P ${dbConfig.port || 3306} -u ${dbConfig.user} ${dbConfig.database} > "\${OUTFILE%.gz}"`;
+      }
+      if (dbConfig.type === 'postgresql') {
+        return `pg_dump -h ${h} -p ${dbConfig.port || 5432} -U ${dbConfig.user} ${dbConfig.database} > "\${OUTFILE%.gz}"`;
+      }
+      if (dbConfig.type === 'mongodb') {
+        const auth = dbConfig.password
+          ? `--username "$DH_MONGO_USER" --password "$DH_MONGO_PWD" --authenticationDatabase admin`
+          : '';
+        return `mongodump --host ${h} --port ${dbConfig.port || 27017} ${auth} --db ${dbConfig.database} --archive="$OUTFILE" --gzip`;
+      }
+      return '';
+    })();
+
+    // 生成备份脚本（heredoc 单引号 EOF：变量不展开，原样写入）
     const scriptContent = `#!/bin/bash
+set -e
+. ${credPath}
 TIMESTAMP=$(date +%Y-%m-%dT%H-%M-%S)
 OUTFILE="${backupDir}/${dbConfig.database}_\${TIMESTAMP}${ext}"
 mkdir -p ${backupDir}
-${buildDumpCommand(dbConfig, dbConfig.type === 'mongodb' ? '$OUTFILE' : '${OUTFILE%.gz}')}
+${dumpForScript}
 ${dbConfig.type !== 'mongodb' ? `gzip -f "\${OUTFILE%.gz}"` : ''}
-ls -t ${backupDir} | tail -n +11 | xargs -I{} rm -f ${backupDir}/{} 2>/dev/null
+ls -t ${backupDir} | tail -n +11 | xargs -I{} rm -f ${backupDir}/{} 2>/dev/null || true
 echo "[$(date)] Backup completed: \$OUTFILE" >> /var/log/deploy-helper-backup.log
 `;
 
     const scriptPath = `/usr/local/bin/deploy-helper-backup-${config.appName}.sh`;
-    await runRemoteSilent(ssh, `cat > ${scriptPath} << 'SCRIPT_EOF'\n${scriptContent}\nSCRIPT_EOF`);
-    await runRemoteSilent(ssh, `chmod +x ${scriptPath}`);
+    await runRemoteSilent(ssh, `cat > ${scriptPath} <<'DH_SCRIPT_EOF'\n${scriptContent}DH_SCRIPT_EOF`);
+    // 脚本本身含密码加载逻辑——chmod 700 仅 root 可读
+    await runRemoteSilent(ssh, `chmod 700 ${scriptPath} && chown root:root ${scriptPath}`);
 
-    // 注入 crontab
+    // 注入 crontab（root 用户的 crontab）
     await runRemoteSilent(
       ssh,
       `(crontab -l 2>/dev/null | grep -v "deploy-helper-backup-${config.appName}"; echo "${cronExpr} ${scriptPath}") | crontab -`
     );
 
     spinner.succeed('定时备份配置完成');
-    console.log(chalk.gray(`  Cron: ${cronExpr}`));
-    console.log(chalk.gray(`  日志: /var/log/deploy-helper-backup.log\n`));
+    console.log(chalk.gray(`  Cron 表达式：${cronExpr}`));
+    console.log(chalk.gray(`  备份脚本：  ${scriptPath} (chmod 700)`));
+    console.log(chalk.gray(`  凭据文件：  ${credPath} (chmod 600)`));
+    console.log(chalk.gray(`  执行日志：  /var/log/deploy-helper-backup.log\n`));
     ssh.dispose();
 
   } catch (err) {

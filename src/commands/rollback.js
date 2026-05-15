@@ -1,8 +1,9 @@
 import chalk from 'chalk';
 import ora from 'ora';
 import inquirer from 'inquirer';
-import { connectSSH, runRemoteSilent } from '../utils/ssh.js';
-import { loadConfig, saveConfig } from '../utils/config.js';
+import { connectSSH, runRemoteSilent, runRemoteStrict } from '../utils/ssh.js';
+import { loadConfig } from '../utils/config.js';
+import { getStartCommands, getStopCommand, getHealthCheck } from '../utils/setup.js';
 
 const SNAPSHOTS_DIR = '/var/deploy-helper/snapshots';
 
@@ -20,7 +21,11 @@ export async function createSnapshot(ssh, config) {
   // 如果当前部署目录存在，就复制一份作为快照
   const exists = await runRemoteSilent(ssh, `test -d ${config.remotePath} && echo yes || echo no`);
   if (exists.stdout.trim() === 'yes') {
-    await runRemoteSilent(ssh, `cp -r ${config.remotePath} ${snapshotPath}`);
+    // 排除大目录（venv / node_modules）节省空间
+    await runRemoteSilent(
+      ssh,
+      `rsync -a --exclude=venv --exclude=node_modules --exclude=__pycache__ ${config.remotePath}/ ${snapshotPath}/`
+    );
 
     // 记录快照元信息
     const meta = JSON.stringify({
@@ -29,7 +34,8 @@ export async function createSnapshot(ssh, config) {
       appName: config.appName,
       remotePath: config.remotePath,
     });
-    await runRemoteSilent(ssh, `echo '${meta}' > ${snapshotPath}/.snapshot-meta.json`);
+    // 用 printf 写入小型元数据 OK（meta 是 JSON，无 % 字符）
+    await runRemoteSilent(ssh, `cat > ${snapshotPath}/.snapshot-meta.json <<'DH_EOF'\n${meta}\nDH_EOF`);
 
     // 只保留最近 5 个快照
     await runRemoteSilent(
@@ -66,6 +72,46 @@ async function listSnapshots(ssh, config) {
     }
   }
   return snapshots;
+}
+
+// 根据 config 重启服务（appMode/conda/composeFile 一致）
+async function restartService(ssh, config) {
+  if (config.appMode === 'cron') {
+    // cron 不需要"重启进程"，crontab 条目仍在；下次定时使用新代码即可
+    return;
+  }
+
+  if (config.projectType === 'nodejs') {
+    // 复用 init 启动逻辑，确保 .start.sh / pm2 配置与新代码匹配
+    const steps = getStartCommands(config);
+    for (const s of steps) {
+      await runRemoteStrict(ssh, s.cmd);
+    }
+    return;
+  }
+
+  if (config.projectType === 'python') {
+    // 已有 supervisor 配置和 venv/conda 环境，直接重启进程即可
+    await runRemoteStrict(ssh, `supervisorctl restart ${config.appName}`);
+    return;
+  }
+
+  if (config.projectType === 'docker') {
+    if (config.composeFile) {
+      await runRemoteStrict(ssh, `cd ${config.remotePath} && docker compose -f ${config.composeFile} up -d --build`);
+    } else {
+      // 单容器：重新构建并启动
+      const steps = getStartCommands(config);
+      for (const s of steps) {
+        await runRemoteStrict(ssh, s.cmd);
+      }
+    }
+    return;
+  }
+
+  if (config.projectType === 'static') {
+    await runRemoteStrict(ssh, `chown -R www-data:www-data ${config.remotePath}`);
+  }
 }
 
 /**
@@ -143,36 +189,47 @@ export async function deployRollback() {
     await createSnapshot(ssh, config);
     preRollbackSpinner.succeed('当前版本已备份');
 
-    // 停止服务
-    const stopSpinner = ora('停止当前服务...').start();
-    if (config.projectType === 'nodejs') {
-      await runRemoteSilent(ssh, `pm2 stop ${config.appName} 2>/dev/null || true`);
-    } else if (config.projectType === 'python') {
-      await runRemoteSilent(ssh, `supervisorctl stop ${config.appName} 2>/dev/null || true`);
-    } else if (config.projectType === 'docker') {
-      await runRemoteSilent(ssh, `cd ${config.remotePath} && docker compose down 2>/dev/null || true`);
+    // 停止服务（cron 模式跳过）
+    const stopCmd = getStopCommand(config);
+    if (stopCmd) {
+      const stopSpinner = ora('停止当前服务...').start();
+      await runRemoteSilent(ssh, stopCmd);
+      stopSpinner.succeed('服务已停止');
     }
-    stopSpinner.succeed('服务已停止');
 
-    // 替换代码目录
+    // 替换代码目录（保留 venv —— 快照排除了它，避免误删环境）
     const restoreSpinner = ora(`还原版本 ${selectedSnapshot}...`).start();
-    await runRemoteSilent(ssh, `rm -rf ${config.remotePath}`);
-    await runRemoteSilent(ssh, `cp -r ${SNAPSHOTS_DIR}/${selectedSnapshot} ${config.remotePath}`);
+    // 保留 venv / node_modules，只覆盖代码部分
+    await runRemoteSilent(
+      ssh,
+      `rsync -a --delete --exclude=venv --exclude=node_modules ${SNAPSHOTS_DIR}/${selectedSnapshot}/ ${config.remotePath}/`
+    );
     await runRemoteSilent(ssh, `rm -f ${config.remotePath}/.snapshot-meta.json`);
     restoreSpinner.succeed('版本已还原');
 
     // 重启服务
     const startSpinner = ora('重启服务...').start();
-    if (config.projectType === 'nodejs') {
-      await runRemoteSilent(ssh, `cd ${config.remotePath} && pm2 restart ${config.appName} || pm2 start ${config.startCmd} --name ${config.appName}`);
-    } else if (config.projectType === 'python') {
-      await runRemoteSilent(ssh, `supervisorctl start ${config.appName}`);
-    } else if (config.projectType === 'docker') {
-      await runRemoteSilent(ssh, `cd ${config.remotePath} && docker compose up -d`);
-    } else if (config.projectType === 'static') {
-      await runRemoteSilent(ssh, `chown -R www-data:www-data ${config.remotePath}`);
+    try {
+      await restartService(ssh, config);
+      startSpinner.succeed('服务已重启');
+    } catch (err) {
+      startSpinner.fail('重启失败：' + err.message);
+      throw err;
     }
-    startSpinner.succeed('服务已重启');
+
+    // 健康检查
+    const health = getHealthCheck(config);
+    if (health) {
+      const hSpinner = ora('验证服务运行状态...').start();
+      await runRemoteSilent(ssh, 'sleep 2');
+      const result = await runRemoteSilent(ssh, health.cmd);
+      const parsed = health.parse(result);
+      if (parsed.ok) {
+        hSpinner.succeed(`服务正常 — ${chalk.gray(parsed.detail)}`);
+      } else {
+        hSpinner.warn(`健康检查未通过 — ${chalk.yellow(parsed.detail)}`);
+      }
+    }
 
     ssh.dispose();
     console.log(chalk.green.bold('\n✅ 回滚成功！'));

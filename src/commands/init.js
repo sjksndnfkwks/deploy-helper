@@ -3,7 +3,9 @@ import chalk from 'chalk';
 import ora from 'ora';
 import path from 'path';
 import os from 'os';
-import { connectSSH, runRemote, runRemoteSilent, uploadDirectory } from '../utils/ssh.js';
+import {
+  connectSSH, runRemote, runRemoteSilent, runRemoteStrict, uploadDirectory,
+} from '../utils/ssh.js';
 import { saveConfig, loadConfig, configExists } from '../utils/config.js';
 import fs from 'fs';
 import {
@@ -13,7 +15,9 @@ import {
   hasDockerfile, detectComposeFile, detectDockerPort,
   PROJECT_TYPE_LABELS, PYTHON_FRAMEWORK_LABELS,
 } from '../utils/detect.js';
-import { getSetupCommands, getStartCommands, getNginxConfig } from '../utils/setup.js';
+import {
+  getSetupCommands, getStartCommands, getNginxConfig, getHealthCheck, writeFileHeredoc,
+} from '../utils/setup.js';
 
 const step = (n, total, msg) =>
   console.log(chalk.cyan(`\n[${n}/${total}] `) + chalk.bold(msg));
@@ -149,7 +153,7 @@ export async function deployInit() {
       type: 'input',
       name: 'keyPath',
       message: 'SSH 密钥路径：',
-      default: `${os.homedir()}/.ssh/id_rsa`,
+      default: path.join(os.homedir(), '.ssh', 'id_rsa'),
       when: (a) => a.authType === 'key',
     },
     {
@@ -270,12 +274,12 @@ export async function deployInit() {
     const composeFile = detectComposeFile();
     const dockerPort = detectDockerPort();
 
-    if (!dockerfileExists) {
-      console.log(chalk.yellow('\n  ⚠ 未检测到 Dockerfile'));
+    if (!dockerfileExists && !composeFile) {
+      console.log(chalk.yellow('\n  ⚠ 未检测到 Dockerfile 或 docker-compose 文件'));
       console.log(chalk.gray('    Docker 部署需要 Dockerfile 或 docker-compose.yml。'));
       console.log(chalk.gray('    如果你的语言/框架比较特殊（Java、C++、CUDA 等），'));
       console.log(chalk.gray('    推荐用 Dockerfile 把运行环境完整封装，deploy-helper 只负责把它跑起来。'));
-    } else {
+    } else if (dockerfileExists) {
       info('检测到 Dockerfile ✓');
     }
 
@@ -444,7 +448,9 @@ export async function deployInit() {
 
   // 确定应用模式与步骤总数
   const appMode = projectType === 'static' ? 'web' : (detailAnswers.appMode || 'web');
-  const cronSchedule = detailAnswers.cronSchedule || detailAnswers.cronPreset;
+  const cronSchedule = detailAnswers.appMode === 'cron'
+    ? (detailAnswers.cronPreset === 'custom' ? detailAnswers.cronSchedule : detailAnswers.cronPreset)
+    : null;
   const isWebService = appMode === 'web';
   const totalSteps = isWebService ? 5 : 4;
 
@@ -473,6 +479,13 @@ export async function deployInit() {
         default: true,
         when: (a) => a.useDomain,
       },
+      {
+        type: 'input',
+        name: 'certEmail',
+        message: 'Let\'s Encrypt 续期通知邮箱（留空则不注册邮箱）：',
+        default: '',
+        when: (a) => a.useHttps,
+      },
     ]);
   } else {
     const modeLabel = appMode === 'cron' ? '定时任务' : '后台脚本';
@@ -494,17 +507,17 @@ export async function deployInit() {
   console.log(chalk.gray('  首次部署需要安装依赖，大约需要 2-5 分钟...\n'));
 
   try {
-    // 创建部署目录
     await runRemote(ssh, `mkdir -p ${config.remotePath}`, '创建部署目录');
 
     const setupSteps = getSetupCommands(config);
     for (const s of setupSteps) {
       const sp = ora(`  ${s.label}...`).start();
       try {
-        await runRemoteSilent(ssh, s.cmd);
+        await runRemoteStrict(ssh, s.cmd);
         sp.succeed(chalk.green(s.label));
       } catch (err) {
-        sp.warn(chalk.yellow(`${s.label} 失败，继续... (${err.message.slice(0, 60)})`));
+        // 安装步骤失败提示但继续（多数是"已安装"或网络抖动）
+        sp.warn(chalk.yellow(`${s.label} 失败：${err.message.split('\n')[0].slice(0, 80)}`));
       }
     }
   } catch (err) {
@@ -517,43 +530,74 @@ export async function deployInit() {
   step(isWebService ? 5 : 4, totalSteps, '上传代码并启动服务');
 
   try {
-    // 上传代码
+    // 上传代码（static 项目需要 dist 目录）
     const uploadSpinner = ora('  上传项目文件...').start();
-    await uploadDirectory(ssh, process.cwd(), config.remotePath, { uploadEnv: !!config.uploadEnv });
+    const skipPatterns = config.projectType === 'static'
+      ? ['node_modules', '.git', '__pycache__', '.DS_Store', '.venv', 'venv']
+      : undefined;
+    await uploadDirectory(ssh, process.cwd(), config.remotePath, {
+      uploadEnv: !!config.uploadEnv,
+      skipPatterns,
+    });
     uploadSpinner.succeed('项目文件上传完成');
     if (config.projectType === 'docker' && !config.uploadEnv && detectedDockerInfo?.localEnvExists) {
       console.log(chalk.yellow('  ℹ .env 未上传，如需环境变量可在服务器手动创建：') + chalk.gray(` ${config.remotePath}/.env`));
     }
 
-    // 启动应用
+    // 启动应用（每一步都必须成功，失败立即抛错）
     const startSteps = getStartCommands(config);
     for (const s of startSteps) {
       const sp = ora(`  ${s.label}...`).start();
-      await runRemoteSilent(ssh, s.cmd);
-      sp.succeed(s.label);
+      try {
+        await runRemoteStrict(ssh, s.cmd);
+        sp.succeed(s.label);
+      } catch (err) {
+        sp.fail(chalk.red(`${s.label} 失败`));
+        throw err;
+      }
     }
 
     // Nginx 只在 web 模式下配置
     if (isWebService) {
       const nginxConf = getNginxConfig(config);
       const nginxPath = `/etc/nginx/sites-available/${config.appName}`;
-      await runRemoteSilent(ssh, `echo '${nginxConf.replace(/'/g, "'\\''")}' > ${nginxPath}`);
-      await runRemoteSilent(ssh, `ln -sf ${nginxPath} /etc/nginx/sites-enabled/${config.appName}`);
-      await runRemoteSilent(ssh, `rm -f /etc/nginx/sites-enabled/default`);
-      await runRemoteSilent(ssh, `nginx -t && systemctl reload nginx`);
+      await runRemoteStrict(ssh, writeFileHeredoc(nginxPath, nginxConf));
+      await runRemoteStrict(ssh, `ln -sf ${nginxPath} /etc/nginx/sites-enabled/${config.appName}`);
+      await runRemoteStrict(ssh, `rm -f /etc/nginx/sites-enabled/default`);
+      await runRemoteStrict(ssh, `nginx -t && systemctl reload nginx`);
       success('Nginx 配置完成');
 
       if (domainAnswers.useHttps && domainAnswers.domain) {
         const httpsSpinner = ora('  申请 SSL 证书...').start();
+        const emailArg = domainAnswers.certEmail && domainAnswers.certEmail.trim()
+          ? `--email ${domainAnswers.certEmail.trim()}`
+          : '--register-unsafely-without-email';
         const certResult = await runRemoteSilent(
           ssh,
-          `certbot --nginx -d ${config.domain} --non-interactive --agree-tos --email admin@${config.domain} --redirect`
+          `certbot --nginx -d ${config.domain} --non-interactive --agree-tos ${emailArg} --redirect`
         );
         if (certResult.code === 0) {
           httpsSpinner.succeed('HTTPS 证书申请成功');
         } else {
-          httpsSpinner.warn('HTTPS 申请失败（可能是域名还没解析），可以之后手动运行 certbot');
+          const tail = (certResult.stderr || certResult.stdout || '').split('\n').slice(-3).join(' ');
+          httpsSpinner.warn(`HTTPS 申请失败（可能是域名还没解析）：${tail.slice(0, 120)}`);
         }
+      }
+    }
+
+    // ── 健康检查 ─────────────────────────────────────────────
+    const health = getHealthCheck(config);
+    if (health) {
+      const hSpinner = ora('  验证服务运行状态...').start();
+      // 给服务 2 秒启动时间
+      await runRemoteSilent(ssh, 'sleep 2');
+      const result = await runRemoteSilent(ssh, health.cmd);
+      const parsed = health.parse(result);
+      if (parsed.ok) {
+        hSpinner.succeed(chalk.green(`服务运行正常 — ${parsed.detail}`));
+      } else {
+        hSpinner.warn(chalk.yellow(`健康检查未通过 — ${parsed.detail}`));
+        console.log(chalk.gray(`  可运行 ${chalk.cyan('deploy-helper status')} 进一步排查。`));
       }
     }
 

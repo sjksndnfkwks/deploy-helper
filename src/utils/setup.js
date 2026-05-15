@@ -1,3 +1,10 @@
+// shell heredoc：用单引号 EOF 防止 $/反引号/% 被解释，正文本身 single-quote 也安全
+function writeFileHeredoc(remotePath, content) {
+  // 使用唯一 sentinel 避免与正文冲突
+  const sentinel = 'DEPLOY_HELPER_EOF';
+  return `cat > ${remotePath} <<'${sentinel}'\n${content}\n${sentinel}`;
+}
+
 // 返回在服务器上执行的 shell 命令数组
 export function getSetupCommands(config) {
   const { projectType, nodeVersion = '20', pythonVersion = '3.11', appMode = 'web' } = config;
@@ -23,11 +30,11 @@ export function getSetupCommands(config) {
   if (projectType === 'nodejs') {
     steps.push({
       label: `安装 Node.js ${nodeVersion}`,
-      cmd: `curl -fsSL https://deb.nodesource.com/setup_${nodeVersion}.x | bash - && apt-get install -y nodejs`,
+      cmd: `command -v node >/dev/null 2>&1 && node -v | grep -q "^v${nodeVersion}\\." || (curl -fsSL https://deb.nodesource.com/setup_${nodeVersion}.x | bash - && apt-get install -y nodejs)`,
     });
     steps.push({
       label: '安装 PM2（进程管理器）',
-      cmd: 'npm install -g pm2',
+      cmd: 'command -v pm2 >/dev/null 2>&1 || npm install -g pm2',
     });
   }
 
@@ -58,15 +65,18 @@ export function getSetupCommands(config) {
           `  apt-get install -y -qq ${pyBin} ${pyBin}-venv ${pyBin}-distutils`,
           `  || apt-get install -y -qq python3 python3-venv`,
           ')',
-          `&& apt-get install -y -qq ${pyBin}-venv 2>/dev/null || apt-get install -y -qq python3-venv 2>/dev/null || true`,
+          `&& (apt-get install -y -qq ${pyBin}-venv 2>/dev/null || apt-get install -y -qq python3-venv 2>/dev/null || true)`,
         ].join(' '),
       });
     }
 
-    steps.push({
-      label: '安装 supervisor（进程管理）',
-      cmd: 'apt-get install -y -qq supervisor',
-    });
+    // cron 模式不需要 supervisor
+    if (appMode !== 'cron') {
+      steps.push({
+        label: '安装 supervisor（进程管理）',
+        cmd: 'command -v supervisorctl >/dev/null 2>&1 || apt-get install -y -qq supervisor',
+      });
+    }
   }
 
   if (projectType === 'docker') {
@@ -92,6 +102,8 @@ export function getSetupCommands(config) {
 function buildCronEntry(appName, schedule, fullCmd) {
   const marker = `deploy-helper:${appName}`;
   const logFile = `/var/log/${appName}.log`;
+  // 注意：crontab 行本身不能有未转义的 % —— 这里 grep -v 用 marker 去重
+  // fullCmd 中如有 % 由调用方负责（typical 启动命令不会有）
   return `(crontab -l 2>/dev/null | grep -v "${marker}"; echo "# ${marker}"; echo "${schedule} ${fullCmd} >> ${logFile} 2>&1") | crontab -`;
 }
 
@@ -100,7 +112,7 @@ export function getStartCommands(config) {
   const {
     projectType, remotePath, startCmd, appName, port,
     pythonVersion = '3.11', pythonFramework, pythonEnvManager = 'pip',
-    appMode = 'web', cronSchedule,
+    appMode = 'web', cronSchedule, composeFile,
   } = config;
 
   if (projectType === 'nodejs') {
@@ -122,25 +134,29 @@ export function getStartCommands(config) {
       return steps;
     }
 
-    const pm2Target = isNpmCmd
-      ? `npm --name ${appName} -- ${startCmd.replace(/^npm\s+/, '')}`
-      : `${remotePath}/.start.sh --name ${appName} --interpreter bash`;
+    // 非 npm 命令通过 .start.sh 包装；npm 命令用 pm2 start npm -- ...
+    const startScript = `${remotePath}/.start.sh`;
+    const startScriptContent = `#!/bin/bash\ncd ${remotePath}\nexec ${startCmd}\n`;
 
     if (!isNpmCmd) {
       steps.push({
         label: '写入启动脚本',
-        cmd: `printf '#!/bin/bash\\ncd ${remotePath}\\n${startCmd}\\n' > ${remotePath}/.start.sh && chmod +x ${remotePath}/.start.sh`,
+        cmd: `${writeFileHeredoc(startScript, startScriptContent)} && chmod +x ${startScript}`,
       });
     }
 
-    // script 模式不自动重启（--no-autorestart）；web 模式正常重启
+    const pm2Target = isNpmCmd
+      ? `npm --name ${appName} -- ${startCmd.replace(/^npm\s+/, '')}`
+      : `${startScript} --name ${appName} --interpreter bash`;
+
+    // script 模式不自动重启；web 模式正常重启
     const pm2StartCmd = appMode === 'script'
-      ? `pm2 delete ${appName} 2>/dev/null || true && pm2 start ${pm2Target} --no-autorestart`
-      : `pm2 delete ${appName} 2>/dev/null || true && pm2 start ${pm2Target}`;
+      ? `pm2 delete ${appName} 2>/dev/null || true; pm2 start ${pm2Target} --no-autorestart`
+      : `pm2 delete ${appName} 2>/dev/null || true; pm2 start ${pm2Target}`;
 
     steps.push(
       { label: `启动应用（PM2${appMode === 'script' ? '，不自动重启' : ''}）`, cmd: pm2StartCmd },
-      { label: '设置 PM2 开机自启', cmd: `pm2 save && pm2 startup | tail -1 | bash || true` },
+      { label: '设置 PM2 开机自启', cmd: `pm2 save && (pm2 startup | tail -1 | bash || true)` },
     );
 
     return steps;
@@ -176,7 +192,6 @@ export function getStartCommands(config) {
         ];
       }
 
-      // web 模式：autorestart=true；script 模式：autorestart=unexpected（崩溃才重启）
       const supervisorConf = getSupervisorConfig({
         appName, remotePath, venvCmd: condaCmd,
         autorestart: appMode === 'script' ? 'unexpected' : 'true',
@@ -185,7 +200,7 @@ export function getStartCommands(config) {
         ...installSteps,
         {
           label: '写入 supervisor 配置',
-          cmd: `printf '${supervisorConf.replace(/'/g, "'\\''")}' > ${supervisorConfPath}`,
+          cmd: writeFileHeredoc(supervisorConfPath, supervisorConf),
         },
         {
           label: '启动应用（supervisor）',
@@ -202,7 +217,7 @@ export function getStartCommands(config) {
     const installSteps = [
       {
         label: '创建 Python 虚拟环境',
-        cmd: `${pyBin} -m venv ${remotePath}/venv || python3 -m venv ${remotePath}/venv`,
+        cmd: `test -d ${remotePath}/venv || (${pyBin} -m venv ${remotePath}/venv || python3 -m venv ${remotePath}/venv)`,
       },
       {
         label: '安装 Python 依赖',
@@ -240,7 +255,7 @@ export function getStartCommands(config) {
       ...installSteps,
       {
         label: '写入 supervisor 配置',
-        cmd: `printf '${supervisorConf.replace(/'/g, "'\\''")}' > ${supervisorConfPath}`,
+        cmd: writeFileHeredoc(supervisorConfPath, supervisorConf),
       },
       {
         label: '启动应用（supervisor）',
@@ -250,8 +265,6 @@ export function getStartCommands(config) {
   }
 
   if (projectType === 'docker') {
-    const { composeFile, appName, port } = config;
-
     if (composeFile) {
       const composeCmd = `docker compose -f ${composeFile}`;
       return [
@@ -292,7 +305,119 @@ export function getStartCommands(config) {
   return [];
 }
 
-// 生成 supervisor 配置内容
+// 停止服务（供 rollback 使用）
+export function getStopCommand(config) {
+  const { projectType, appName, remotePath, appMode = 'web', composeFile } = config;
+
+  if (appMode === 'cron') {
+    // cron 不需要停止；下次定时不命中即可。
+    // 如果想立即停，可以从 crontab 移除——但 rollback 之后通常想保留定时
+    return null;
+  }
+
+  if (projectType === 'nodejs') {
+    return `pm2 stop ${appName} 2>/dev/null || true`;
+  }
+  if (projectType === 'python') {
+    return `supervisorctl stop ${appName} 2>/dev/null || true`;
+  }
+  if (projectType === 'docker') {
+    if (composeFile) {
+      return `cd ${remotePath} && docker compose -f ${composeFile} down 2>/dev/null || true`;
+    }
+    return `docker stop ${appName} 2>/dev/null || true; docker rm ${appName} 2>/dev/null || true`;
+  }
+  return null;
+}
+
+// 健康检查：返回 { cmd, parse } —— parse 接受 {stdout, code} 返回 { ok, detail }
+export function getHealthCheck(config) {
+  const { projectType, appName, remotePath, appMode = 'web', composeFile, pythonEnvManager } = config;
+
+  if (appMode === 'cron') {
+    const marker = `deploy-helper:${appName}`;
+    return {
+      cmd: `crontab -l 2>/dev/null | grep -F "${marker}" | head -1`,
+      parse: ({ stdout }) => stdout
+        ? { ok: true, detail: '已写入 crontab' }
+        : { ok: false, detail: '未在 crontab 中找到该任务' },
+    };
+  }
+
+  if (projectType === 'nodejs') {
+    return {
+      cmd: `pm2 jlist 2>/dev/null`,
+      parse: ({ stdout }) => {
+        try {
+          const list = JSON.parse(stdout || '[]');
+          const app = list.find(p => p.name === appName);
+          if (!app) return { ok: false, detail: `PM2 中未找到 ${appName}` };
+          const status = app.pm2_env?.status;
+          return status === 'online'
+            ? { ok: true, detail: `PM2 状态: online (PID ${app.pid})` }
+            : { ok: false, detail: `PM2 状态: ${status}` };
+        } catch {
+          return { ok: false, detail: 'pm2 jlist 解析失败' };
+        }
+      },
+    };
+  }
+
+  if (projectType === 'python') {
+    return {
+      cmd: `supervisorctl status ${appName} 2>&1 || true`,
+      parse: ({ stdout }) => {
+        const line = stdout.trim();
+        if (/RUNNING/.test(line)) return { ok: true, detail: line };
+        return { ok: false, detail: line || 'supervisor 未返回状态' };
+      },
+    };
+  }
+
+  if (projectType === 'docker') {
+    if (composeFile) {
+      return {
+        cmd: `cd ${remotePath} && docker compose -f ${composeFile} ps --format json 2>/dev/null || true`,
+        parse: ({ stdout }) => {
+          const raw = stdout.trim();
+          if (!raw) return { ok: false, detail: 'docker compose ps 无输出' };
+          // 兼容两种格式：旧版 docker compose 输出 JSON 数组，新版输出 NDJSON
+          let services = [];
+          try {
+            const parsed = JSON.parse(raw);
+            services = Array.isArray(parsed) ? parsed : [parsed];
+          } catch {
+            services = raw.split('\n').filter(Boolean)
+              .map(l => { try { return JSON.parse(l); } catch { return null; } })
+              .filter(Boolean);
+          }
+          if (services.length === 0) return { ok: false, detail: '未找到运行中的服务' };
+          const allRunning = services.every(s => /running|up/i.test(s.State || s.Status || ''));
+          return {
+            ok: allRunning,
+            detail: services.map(s => `${s.Service || s.Name}: ${s.State || s.Status}`).join('; '),
+          };
+        },
+      };
+    }
+    return {
+      cmd: `docker inspect -f '{{.State.Status}}' ${appName} 2>/dev/null || echo missing`,
+      parse: ({ stdout }) => stdout.trim() === 'running'
+        ? { ok: true, detail: '容器运行中' }
+        : { ok: false, detail: `容器状态: ${stdout.trim()}` },
+    };
+  }
+
+  // static 没有进程，认为只要 Nginx 在跑即可
+  return {
+    cmd: `systemctl is-active nginx 2>/dev/null || true`,
+    parse: ({ stdout }) => stdout.trim() === 'active'
+      ? { ok: true, detail: 'Nginx active' }
+      : { ok: false, detail: `Nginx 状态: ${stdout.trim()}` },
+  };
+}
+
+// 生成 supervisor 配置内容（heredoc 写入，使用真实换行）
 // autorestart: 'true'（始终重启）| 'unexpected'（仅崩溃时重启）| 'false'
 function getSupervisorConfig({ appName, remotePath, venvCmd, autorestart = 'true' }) {
   return [
@@ -304,7 +429,7 @@ function getSupervisorConfig({ appName, remotePath, venvCmd, autorestart = 'true
     `stderr_logfile=/var/log/${appName}.err.log`,
     `stdout_logfile=/var/log/${appName}.out.log`,
     ``,
-  ].join('\\n');
+  ].join('\n');
 }
 
 // 生成 Nginx 配置
@@ -344,3 +469,6 @@ export function getNginxConfig(config) {
     }
 }`;
 }
+
+// 把任意字符串内容写入服务器文件的 shell 命令（heredoc 方式）
+export { writeFileHeredoc };

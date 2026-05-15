@@ -153,24 +153,33 @@ async function pushEnv(config, envContent, vars) {
     await runRemoteSilent(ssh, `chmod 600 ${config.remotePath}/.env`);
     uploadSpinner.succeed('.env 上传完成，权限已设为 600');
 
-    // 重启服务让新环境变量生效
-    const { restart } = await inquirer.prompt([{
-      type: 'confirm',
-      name: 'restart',
-      message: '是否重启服务让新变量生效？',
-      default: true,
-    }]);
+    // cron 模式不需要重启（下次定时使用新环境变量）
+    const appMode = config.appMode || 'web';
+    if (appMode === 'cron') {
+      console.log(chalk.gray('  ℹ 定时任务模式，新 .env 将在下次执行时生效'));
+    } else {
+      const { restart } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'restart',
+        message: '是否重启服务让新变量生效？',
+        default: true,
+      }]);
 
-    if (restart) {
-      const restartSpinner = ora('重启服务...').start();
-      if (config.projectType === 'nodejs') {
-        await runRemoteSilent(ssh, `pm2 restart ${config.appName}`);
-      } else if (config.projectType === 'python') {
-        await runRemoteSilent(ssh, `supervisorctl restart ${config.appName}`);
-      } else if (config.projectType === 'docker') {
-        await runRemoteSilent(ssh, `cd ${config.remotePath} && docker compose up -d`);
+      if (restart) {
+        const restartSpinner = ora('重启服务...').start();
+        if (config.projectType === 'nodejs') {
+          await runRemoteSilent(ssh, `pm2 restart ${config.appName}`);
+        } else if (config.projectType === 'python') {
+          await runRemoteSilent(ssh, `supervisorctl restart ${config.appName}`);
+        } else if (config.projectType === 'docker') {
+          if (config.composeFile) {
+            await runRemoteSilent(ssh, `cd ${config.remotePath} && docker compose -f ${config.composeFile} up -d`);
+          } else {
+            await runRemoteSilent(ssh, `docker restart ${config.appName}`);
+          }
+        }
+        restartSpinner.succeed('服务已重启');
       }
-      restartSpinner.succeed('服务已重启');
     }
 
     ssh.dispose();

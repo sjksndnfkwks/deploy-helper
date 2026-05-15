@@ -1,23 +1,29 @@
 import chalk from 'chalk';
 import ora from 'ora';
 import inquirer from 'inquirer';
-import { connectSSH, runRemoteSilent, uploadDirectory } from '../utils/ssh.js';
+import { connectSSH, runRemoteSilent, runRemoteStrict, uploadDirectory } from '../utils/ssh.js';
 import { loadConfig, saveConfig } from '../utils/config.js';
 import { createSnapshot } from './rollback.js';
 import { doBackup } from './backup.js';
-
-const info = (msg) => console.log(chalk.gray('  ℹ ') + msg);
+import { getStartCommands, getHealthCheck } from '../utils/setup.js';
 
 /**
  * 对单台服务器执行部署流程
+ *
+ * 流程：连接 → 快照 → 上传代码 → 复用 init 的 getStartCommands → 健康检查
+ *
+ * 兼容性：旧版 config 没有 appMode 字段时，根据 projectType + domain 推断：
+ *   - 有 domain 或 projectType=static → web
+ *   - 否则 → script（保守起见）
  */
 async function deployToServer(serverConfig) {
   const label = serverConfig.label ? chalk.cyan(`[${serverConfig.label}] `) : '';
+  const cfg = normalizeConfig(serverConfig);
 
   let ssh;
-  const connectSpinner = ora(`${label}连接服务器 ${serverConfig.host}...`).start();
+  const connectSpinner = ora(`${label}连接服务器 ${cfg.host}...`).start();
   try {
-    ssh = await connectSSH(serverConfig);
+    ssh = await connectSSH(cfg);
     connectSpinner.succeed(`${label}连接成功`);
   } catch (err) {
     connectSpinner.fail(`${label}连接失败：${err.message}`);
@@ -27,40 +33,50 @@ async function deployToServer(serverConfig) {
   try {
     // 1. 创建快照（部署前备份当前版本）
     const snapSpinner = ora(`${label}创建版本快照...`).start();
-    const snapName = await createSnapshot(ssh, serverConfig);
+    const snapName = await createSnapshot(ssh, cfg);
     if (snapName) {
       snapSpinner.succeed(`${label}快照已创建：${chalk.gray(snapName)}`);
     } else {
       snapSpinner.info(`${label}跳过快照（首次部署）`);
     }
 
-    // 2. 上传代码
+    // 2. 上传代码（static 不跳 dist，并透传 uploadEnv）
     const uploadSpinner = ora(`${label}上传代码...`).start();
-    await uploadDirectory(ssh, process.cwd(), serverConfig.remotePath);
+    const skipPatterns = cfg.projectType === 'static'
+      ? ['node_modules', '.git', '__pycache__', '.DS_Store', '.venv', 'venv']
+      : undefined;
+    await uploadDirectory(ssh, process.cwd(), cfg.remotePath, {
+      uploadEnv: !!cfg.uploadEnv,
+      skipPatterns,
+    });
     uploadSpinner.succeed(`${label}代码上传完成`);
 
-    // 3. 安装依赖 & 重启
-    if (serverConfig.projectType === 'nodejs') {
-      const sp = ora(`${label}安装依赖 & 重启...`).start();
-      await runRemoteSilent(ssh, `cd ${serverConfig.remotePath} && npm install --production --silent`);
-      await runRemoteSilent(ssh, `pm2 restart ${serverConfig.appName} || pm2 start ${serverConfig.startCmd} --name ${serverConfig.appName}`);
-      sp.succeed(`${label}Node.js 服务已重启`);
+    // 3. 复用 init 的启动命令（保证 update 与 init 行为一致）
+    const startSteps = getStartCommands(cfg);
+    for (const s of startSteps) {
+      const sp = ora(`${label}${s.label}...`).start();
+      try {
+        await runRemoteStrict(ssh, s.cmd);
+        sp.succeed(`${label}${s.label}`);
+      } catch (err) {
+        sp.fail(`${label}${s.label} 失败`);
+        throw err;
+      }
+    }
 
-    } else if (serverConfig.projectType === 'python') {
-      const sp = ora(`${label}更新依赖 & 重启...`).start();
-      await runRemoteSilent(ssh, `cd ${serverConfig.remotePath} && pip3 install -r requirements.txt -q`);
-      await runRemoteSilent(ssh, `supervisorctl restart ${serverConfig.appName}`);
-      sp.succeed(`${label}Python 服务已重启`);
-
-    } else if (serverConfig.projectType === 'docker') {
-      const sp = ora(`${label}重新构建容器...`).start();
-      await runRemoteSilent(ssh, `cd ${serverConfig.remotePath} && docker compose up -d --build`);
-      sp.succeed(`${label}容器已更新`);
-
-    } else if (serverConfig.projectType === 'static') {
-      const sp = ora(`${label}刷新文件权限...`).start();
-      await runRemoteSilent(ssh, `chown -R www-data:www-data ${serverConfig.remotePath}`);
-      sp.succeed(`${label}静态文件已更新`);
+    // 4. 健康检查
+    const health = getHealthCheck(cfg);
+    if (health) {
+      const hSpinner = ora(`${label}验证服务运行状态...`).start();
+      await runRemoteSilent(ssh, 'sleep 2');
+      const result = await runRemoteSilent(ssh, health.cmd);
+      const parsed = health.parse(result);
+      if (parsed.ok) {
+        hSpinner.succeed(`${label}服务正常 — ${chalk.gray(parsed.detail)}`);
+      } else {
+        hSpinner.warn(`${label}健康检查未通过 — ${chalk.yellow(parsed.detail)}`);
+        console.log(chalk.gray(`  ${label}如服务异常，可运行 deploy-helper rollback 回滚`));
+      }
     }
 
     ssh.dispose();
@@ -68,10 +84,23 @@ async function deployToServer(serverConfig) {
 
   } catch (err) {
     console.log(chalk.red(`\n${label}部署失败：${err.message}`));
-    console.log(chalk.gray(`  运行 deploy-helper rollback 可恢复上一个版本`));
+    console.log(chalk.gray(`  运行 ${chalk.cyan('deploy-helper rollback')} 可恢复上一个版本`));
     ssh.dispose();
     return false;
   }
+}
+
+// 旧配置兼容：补齐 appMode 等新字段，方便老用户升级 deploy-helper 后 update
+function normalizeConfig(serverConfig) {
+  const cfg = { ...serverConfig };
+  if (!cfg.appMode) {
+    // 老配置：有 domain / useHttps 或是 static 都视为 web
+    cfg.appMode = (cfg.domain || cfg.useHttps || cfg.projectType === 'static') ? 'web' : 'web';
+  }
+  if (cfg.projectType === 'python' && !cfg.pythonEnvManager) {
+    cfg.pythonEnvManager = 'pip';
+  }
+  return cfg;
 }
 
 export async function deployUpdate() {
@@ -89,9 +118,9 @@ export async function deployUpdate() {
   // 显示目标信息
   console.log('');
   if (servers.length === 1) {
-    info(`服务器：${servers[0].host}   应用：${config.appName}`);
+    console.log(chalk.gray('  ℹ ') + `服务器：${servers[0].host}   应用：${config.appName}   模式：${config.appMode || 'web'}`);
   } else {
-    info(`将部署到 ${chalk.bold(servers.length)} 台服务器：`);
+    console.log(chalk.gray('  ℹ ') + `将部署到 ${chalk.bold(servers.length)} 台服务器：`);
     servers.forEach(s => {
       console.log(chalk.gray(`    • ${s.label || s.host}  (${s.host})`));
     });
@@ -193,10 +222,16 @@ export async function deployUpdate() {
   }
 
   const main = servers[0];
-  const url = main.useHttps && main.domain
-    ? `https://${main.domain}`
-    : main.domain ? `http://${main.domain}` : `http://${main.host}`;
-  console.log(`  访问地址：${chalk.cyan.underline(url)}\n`);
+  if (main.appMode === 'web' || !main.appMode) {
+    const url = main.useHttps && main.domain
+      ? `https://${main.domain}`
+      : main.domain ? `http://${main.domain}` : `http://${main.host}`;
+    console.log(`  访问地址：${chalk.cyan.underline(url)}\n`);
+  } else if (main.appMode === 'cron') {
+    console.log(`  定时计划：${chalk.cyan(main.cronSchedule || '见 crontab -l')}\n`);
+  } else {
+    console.log(`  进程状态：${chalk.cyan(`supervisorctl status ${main.appName}`)}\n`);
+  }
 }
 
 /**
