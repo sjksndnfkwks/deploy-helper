@@ -1,8 +1,295 @@
 # deploy-helper
 
+> Deploy your project to any VPS by answering a few questions.
+
+No need to know Nginx, PM2, Certbot, or supervisor — deploy-helper handles server configuration, process management, HTTPS certificates, and code updates for you.
+
+[中文文档](#中文文档)
+
+---
+
+## Quick Start
+
+```bash
+npx @zhengyizhao/deploy-helper init
+```
+
+Or install globally:
+
+```bash
+npm install -g @zhengyizhao/deploy-helper
+deploy-helper init
+```
+
+---
+
+## How It Works
+
+**Web service** (5 steps):
+
+```
+[1/5] Server credentials    → Enter IP, SSH key/password, connection tested immediately
+[2/5] Project info          → Auto-detect type, version, start command — confirm each
+[3/5] Domain & HTTPS        → Optional, auto-issue Let's Encrypt certificate
+[4/5] Install server env    → Install dependencies as needed, skip if already installed
+[5/5] Upload & start        → Upload → start process → configure Nginx → health check
+```
+
+**Background script / cron job** (4 steps, skips domain and Nginx):
+
+```
+[1/4] Server credentials
+[2/4] Project info (including run mode selection)
+[3/4] Install server env
+[4/4] Upload & start
+```
+
+After deployment:
+
+```
+🎉 Deployment successful!
+
+  # Web service
+  URL: https://example.com
+
+  # Cron job
+  Schedule:  0 2 * * *
+  Logs:      tail -f /var/log/myapp.log
+
+  # Background script
+  Status:    supervisorctl status myapp
+  Stdout:    tail -f /var/log/myapp.out.log
+```
+
+---
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `deploy-helper init` | First-time deployment, fully guided |
+| `deploy-helper update` | Push latest code and restart (supports multiple servers) |
+| `deploy-helper status` | View process status, memory usage, recent logs |
+| `deploy-helper rollback` | Roll back to a previous snapshot |
+| `deploy-helper env` | Upload / pull / diff `.env` files |
+| `deploy-helper backup` | Database backup (MySQL / PostgreSQL / MongoDB) |
+| `deploy-helper servers` | Manage multiple servers |
+
+---
+
+## Run Modes
+
+Choose one during `init`. This determines process management and whether Nginx is configured:
+
+| Mode | Use case | Process manager | Nginx |
+|------|----------|----------------|-------|
+| **Web service** | API, website, Next.js | PM2 / supervisor (auto-restart) | ✓ Reverse proxy |
+| **Background script** | Crawler, queue consumer, long-running task | PM2 / supervisor (restart on crash only) | ✗ |
+| **Cron job** | Scheduled sync, periodic cleanup | System crontab | ✗ |
+
+---
+
+## Supported Project Types
+
+### Node.js
+
+Auto-detects: `.nvmrc` / `.node-version` / `package.json engines.node` → Node.js version; `package.json scripts.start` / common entry files → start command.
+
+- Process manager: **PM2** (auto-restart, starts on boot)
+- Works with `npm start`, `node server.js`, `next start`, and everything else
+- **Script mode**: PM2 with `--no-autorestart` — won't restart after a clean exit
+- **Cron mode**: writes to crontab, logs to `/var/log/<appname>.log`
+
+### Python
+
+Auto-detects: `.python-version` / `pyproject.toml` → Python version; `requirements.txt` → framework (FastAPI / Django / Flask) → recommended start command; `environment.yml` / `conda-lock.yml` → conda mode.
+
+Process manager: **supervisor** (auto-restart, starts on boot, logs to `/var/log/<appname>.out.log` + `.err.log`)
+
+**pip mode** (has `requirements.txt`)
+- Installs Python automatically if missing (deadsnakes PPA, supports 3.8–3.13), skips if already installed
+- Creates a virtualenv — all packages isolated inside `venv/`, nothing written to the system
+- FastAPI → uvicorn; Django / Flask → gunicorn
+- **Script mode**: supervisor `autorestart=unexpected` — only restarts on crash, not on clean exit
+- **Cron mode**: writes to crontab, runs using the venv Python
+
+**conda mode** (has `environment.yml`)
+- Installs Miniconda to `/opt/miniconda3` automatically, skips if already present
+- Creates the conda environment from `environment.yml` (`conda env create -n <appname>`); on re-deploy, runs `--prune` for incremental updates
+- Start command runs via `conda run -n <appname> --no-capture-output` — no `conda activate` needed
+
+**Generate environment.yml locally**
+
+```bash
+conda activate <your-env-name>
+conda env export > environment.yml
+```
+
+> If your environment includes CUDA / cudatoolkit or other system-level packages, use Docker instead (see below) to avoid GPU driver version mismatches.
+
+### Docker
+
+Works for **everything** deploy-helper doesn't natively support: Java, Go, Rust, C++, CUDA, multi-service orchestration… As long as you have a Dockerfile, the deployment is language-agnostic.
+
+Auto-detects:
+- `Dockerfile` — noted if present, guided if missing
+- `docker-compose.yml` / `docker-compose.yaml` / `compose.yml` / `compose.yaml` — used automatically
+- `EXPOSE` in Dockerfile or `ports` in compose file — reads the host port
+
+Two deploy modes:
+
+| Mode | Condition | Command |
+|------|-----------|---------|
+| Compose mode | compose file detected | `docker compose -f <file> up -d --build --remove-orphans` |
+| Single-container mode | Dockerfile only | `docker build` + `docker run --restart unless-stopped` |
+
+**Docker install**: the tool checks `command -v docker` first and skips installation if Docker is already present. Many cloud provider images ship with Docker pre-installed.
+
+**.env files**: not uploaded by default (may contain secrets). If a local `.env` is detected, you'll be asked whether to upload it; if you decline, the tool shows the server path where you can create it manually.
+
+### Static Sites
+
+Plain HTML / CSS / JS, served directly by Nginx. Gzip and SPA fallback routing are configured automatically. Build output in `dist/` is uploaded normally (not skipped).
+
+---
+
+## Other Languages
+
+> Java, C++, Go, Rust, CUDA, R…
+
+Recommended path: write a Dockerfile to package your runtime environment, then choose the Docker type. deploy-helper doesn't need to know your language — it just runs the container. When you select `Other`, the tool prints these starter templates:
+
+**Python + conda / CUDA**
+```dockerfile
+FROM continuumio/miniconda3
+WORKDIR /app
+COPY environment.yml .
+RUN conda env create -f environment.yml -n myenv
+COPY . .
+CMD ["conda", "run", "-n", "myenv", "--no-capture-output", "python", "main.py"]
+```
+
+**Java (Maven + JDK 21)**
+```dockerfile
+FROM maven:3.9-eclipse-temurin-21-alpine AS build
+WORKDIR /app
+COPY pom.xml .
+RUN mvn dependency:resolve -q
+COPY src ./src
+RUN mvn package -DskipTests -q
+FROM eclipse-temurin:21-jre-alpine
+COPY --from=build /app/target/*.jar app.jar
+EXPOSE 8080
+CMD ["java", "-jar", "app.jar"]
+```
+
+**Go**
+```dockerfile
+FROM golang:1.22-alpine AS build
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go build -o main .
+FROM alpine:latest
+COPY --from=build /app/main .
+EXPOSE 8080
+CMD ["./main"]
+```
+
+Dockerfile reference: https://docs.docker.com/get-started/
+
+---
+
+## update
+
+```bash
+deploy-helper update
+```
+
+- Creates a code snapshot before deploying — rollback is always available
+- Reuses init's startup logic: appMode / conda / composeFile all respected
+- Health check after restart (PM2 online / supervisor RUNNING / container running)
+- Multi-server support: parallel, serial, or rolling strategies
+
+---
+
+## rollback
+
+```bash
+deploy-helper rollback
+```
+
+Every `update` creates a snapshot automatically (last 5 kept). Rolling back:
+
+1. Backs up the current version first (so you can undo the rollback)
+2. Stops the service
+3. Restores code via rsync (preserves `venv/` / `node_modules/`, only replaces code)
+4. Restarts the service + health check
+
+---
+
+## env
+
+```bash
+deploy-helper env
+```
+
+- **Push**: local `.env` → server (backs up the old one first, sets permissions to 600, restarts service)
+- **Pull**: server `.env` → local
+- **Diff**: shows key-level differences (added / missing / changed values)
+
+---
+
+## backup
+
+```bash
+deploy-helper backup
+```
+
+Supports MySQL, PostgreSQL, and MongoDB:
+
+- Immediate backup (dump + gzip)
+- List / download previous backups (last 10 kept)
+- Scheduled automatic backups (crontab)
+
+**Security**: database credentials for scheduled backups are stored in `/etc/deploy-helper/<appname>.creds` (chmod 600, owned by root). The backup script itself is chmod 700 — passwords are never exposed in world-readable locations.
+
+---
+
+## Requirements
+
+**Local machine**
+- Node.js 18+
+
+**Server**
+- Ubuntu 20.04 / 22.04 / 24.04
+- Root access or sudo
+- Ports open: 22 (SSH), 80 (HTTP), 443 (HTTPS if needed)
+
+**Nothing needs to be pre-installed on the server** — Nginx, Node.js, Python, Docker, PM2, supervisor, and certbot are all installed on demand, and skipped if already present.
+
+---
+
+## Config File
+
+After the first deployment, `.deploy-config.json` is written to your project root. It stores the server address, deploy path, start command, and more. The tool automatically adds it to `.gitignore` — it may contain passwords or keys and should never be committed.
+
+---
+
+## License
+
+MIT
+
+---
+
+# 中文文档
+
 > 把项目部署到任意 VPS，回答几个问题就够了。
 
 不需要懂 Nginx、PM2、Certbot、supervisor——工具替你搞定服务器配置、进程管理、HTTPS 证书、代码更新。
+
+[English Documentation](#deploy-helper)
 
 ---
 
@@ -96,7 +383,7 @@ init 时选择三种模式之一，影响进程管理和是否配置 Nginx：
 - 进程管理：**PM2**（自动重启、开机自启）
 - 支持 `npm start`、`node server.js`、`next start` 等所有启动方式
 - **后台脚本模式**：PM2 加 `--no-autorestart`，进程正常退出后不重启
-- **定时任务模式**：写入 crontab，按计划执行，日志写入 `/var/log/<appname>.log`
+- **定时任务模式**：写入 crontab，日志写入 `/var/log/<appname>.log`
 
 ### Python
 
@@ -222,7 +509,7 @@ deploy-helper rollback
 
 1. 备份当前版本（以便反悔）
 2. 停止服务
-3. 用 rsync 还原代码（保留 `venv/` / `node_modules`，只换代码）
+3. 用 rsync 还原代码（保留 `venv/` / `node_modules/`，只换代码）
 4. 重启服务 + 健康检查
 
 ---
