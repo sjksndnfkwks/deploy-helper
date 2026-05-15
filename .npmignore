@@ -1,0 +1,4 @@
+.claude/
+.git/
+.gitignore
+*.local.json
