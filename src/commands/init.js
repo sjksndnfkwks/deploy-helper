@@ -303,6 +303,24 @@ export async function deployInit() {
     showDockerTemplateGuide();
   }
 
+  // 推断默认应用模式，供用户确认
+  let detectedAppMode = null;
+  if (projectType === 'static') {
+    detectedAppMode = 'web';
+  } else if (projectType === 'nodejs') {
+    detectedAppMode = 'web';
+  } else if (projectType === 'python' && detectedPyFramework) {
+    detectedAppMode = 'web';
+  } else if (projectType === 'docker' && detectedDockerInfo?.dockerPort) {
+    detectedAppMode = 'web';
+  }
+
+  if (detectedAppMode === 'web') {
+    info('应用模式：Web 服务（将配置端口 + Nginx 反向代理）');
+  } else if (projectType !== 'unknown') {
+    info('应用模式未能自动判断，请手动选择（影响是否配置 Nginx 和端口）');
+  }
+
   // 第二步：让用户确认所有检测结果，port 在 startCmd 之前以便生成默认命令
   const detailAnswers = await inquirer.prompt([
     {
@@ -350,6 +368,18 @@ export async function deployInit() {
       when: () => projectType === 'python',
     },
     {
+      type: 'list',
+      name: 'appMode',
+      message: '确认应用运行方式：',
+      default: detectedAppMode || 'web',
+      choices: [
+        { name: 'Web 服务（监听端口，通过浏览器 / API 访问）', value: 'web' },
+        { name: '后台脚本（长期运行，不对外提供 HTTP 服务）', value: 'script' },
+        { name: '定时任务（按计划执行，跑完自动退出）', value: 'cron' },
+      ],
+      when: () => projectType !== 'static',
+    },
+    {
       type: 'input',
       name: 'port',
       message: '应用监听的端口（宿主机端口，Nginx 将代理到此）：',
@@ -358,7 +388,7 @@ export async function deployInit() {
         if (projectType === 'python') return '8000';
         return '3000';
       },
-      when: () => ['nodejs', 'python', 'docker'].includes(projectType),
+      when: (a) => ['nodejs', 'python', 'docker'].includes(projectType) && (a.appMode ?? 'web') === 'web',
     },
     {
       type: 'input',
@@ -387,46 +417,80 @@ export async function deployInit() {
       },
       when: () => ['nodejs', 'python'].includes(projectType),
     },
+    {
+      type: 'list',
+      name: 'cronPreset',
+      message: '执行频率：',
+      choices: [
+        { name: '每天凌晨 2 点      (0 2 * * *)',   value: '0 2 * * *' },
+        { name: '每小时整点         (0 * * * *)',   value: '0 * * * *' },
+        { name: '每 6 小时          (0 */6 * * *)', value: '0 */6 * * *' },
+        { name: '每周一凌晨 2 点    (0 2 * * 1)',   value: '0 2 * * 1' },
+        { name: '自定义 cron 表达式',               value: 'custom' },
+      ],
+      when: (a) => a.appMode === 'cron',
+    },
+    {
+      type: 'input',
+      name: 'cronSchedule',
+      message: 'Cron 表达式（分 时 日 月 周）：',
+      default: '0 2 * * *',
+      validate: (v) => /^(\S+\s+){4}\S+$/.test(v.trim()) ? true : '格式：分 时 日 月 周，如 0 2 * * *（每天凌晨 2 点）',
+      when: (a) => a.appMode === 'cron' && a.cronPreset === 'custom',
+    },
   ]);
 
   const projectAnswers = { ...typeAnswers, ...detailAnswers };
 
-  // ── Step 3: 域名 & HTTPS ──────────────────────────────────────
-  step(3, 5, '域名 & HTTPS（可选）');
+  // 确定应用模式与步骤总数
+  const appMode = projectType === 'static' ? 'web' : (detailAnswers.appMode || 'web');
+  const cronSchedule = detailAnswers.cronSchedule || detailAnswers.cronPreset;
+  const isWebService = appMode === 'web';
+  const totalSteps = isWebService ? 5 : 4;
 
-  const domainAnswers = await inquirer.prompt([
-    {
-      type: 'confirm',
-      name: 'useDomain',
-      message: '是否配置域名？（没有域名用 IP 也可以）',
-      default: true,
-    },
-    {
-      type: 'input',
-      name: 'domain',
-      message: '你的域名（如 example.com）：',
-      when: (a) => a.useDomain,
-      validate: (v) => v.trim() ? true : '请输入域名',
-    },
-    {
-      type: 'confirm',
-      name: 'useHttps',
-      message: '是否自动申请 HTTPS 证书？（免费，需要域名已解析到此服务器）',
-      default: true,
-      when: (a) => a.useDomain,
-    },
-  ]);
+  // ── Step 3: 域名 & HTTPS（仅 web 服务需要）────────────────────
+  let domainAnswers = {};
+  if (isWebService) {
+    step(3, totalSteps, '域名 & HTTPS（可选）');
+    domainAnswers = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'useDomain',
+        message: '是否配置域名？（没有域名用 IP 也可以）',
+        default: true,
+      },
+      {
+        type: 'input',
+        name: 'domain',
+        message: '你的域名（如 example.com）：',
+        when: (a) => a.useDomain,
+        validate: (v) => v.trim() ? true : '请输入域名',
+      },
+      {
+        type: 'confirm',
+        name: 'useHttps',
+        message: '是否自动申请 HTTPS 证书？（免费，需要域名已解析到此服务器）',
+        default: true,
+        when: (a) => a.useDomain,
+      },
+    ]);
+  } else {
+    const modeLabel = appMode === 'cron' ? '定时任务' : '后台脚本';
+    info(`跳过域名配置（${modeLabel}无需 Nginx 反向代理）`);
+  }
 
   const config = {
     ...serverAnswers,
     ...projectAnswers,
     ...domainAnswers,
+    appMode,
+    cronSchedule,
     domain: domainAnswers.domain || serverAnswers.host,
     deployedAt: new Date().toISOString(),
   };
 
   // ── Step 4: 安装环境 ──────────────────────────────────────────
-  step(4, 5, '在服务器上安装运行环境');
+  step(isWebService ? 4 : 3, totalSteps, '在服务器上安装运行环境');
   console.log(chalk.gray('  首次部署需要安装依赖，大约需要 2-5 分钟...\n'));
 
   try {
@@ -450,7 +514,7 @@ export async function deployInit() {
   }
 
   // ── Step 5: 上传代码 & 启动 ──────────────────────────────────
-  step(5, 5, '上传代码并启动服务');
+  step(isWebService ? 5 : 4, totalSteps, '上传代码并启动服务');
 
   try {
     // 上传代码
@@ -469,26 +533,27 @@ export async function deployInit() {
       sp.succeed(s.label);
     }
 
-    // 配置 Nginx
-    const nginxConf = getNginxConfig(config);
-    const nginxPath = `/etc/nginx/sites-available/${config.appName}`;
-    await runRemoteSilent(ssh, `echo '${nginxConf.replace(/'/g, "'\\''")}' > ${nginxPath}`);
-    await runRemoteSilent(ssh, `ln -sf ${nginxPath} /etc/nginx/sites-enabled/${config.appName}`);
-    await runRemoteSilent(ssh, `rm -f /etc/nginx/sites-enabled/default`);
-    await runRemoteSilent(ssh, `nginx -t && systemctl reload nginx`);
-    success('Nginx 配置完成');
+    // Nginx 只在 web 模式下配置
+    if (isWebService) {
+      const nginxConf = getNginxConfig(config);
+      const nginxPath = `/etc/nginx/sites-available/${config.appName}`;
+      await runRemoteSilent(ssh, `echo '${nginxConf.replace(/'/g, "'\\''")}' > ${nginxPath}`);
+      await runRemoteSilent(ssh, `ln -sf ${nginxPath} /etc/nginx/sites-enabled/${config.appName}`);
+      await runRemoteSilent(ssh, `rm -f /etc/nginx/sites-enabled/default`);
+      await runRemoteSilent(ssh, `nginx -t && systemctl reload nginx`);
+      success('Nginx 配置完成');
 
-    // HTTPS
-    if (domainAnswers.useHttps && domainAnswers.domain) {
-      const httpsSpinner = ora('  申请 SSL 证书...').start();
-      const certResult = await runRemoteSilent(
-        ssh,
-        `certbot --nginx -d ${config.domain} --non-interactive --agree-tos --email admin@${config.domain} --redirect`
-      );
-      if (certResult.code === 0) {
-        httpsSpinner.succeed(`HTTPS 证书申请成功`);
-      } else {
-        httpsSpinner.warn('HTTPS 申请失败（可能是域名还没解析），可以之后手动运行 certbot）');
+      if (domainAnswers.useHttps && domainAnswers.domain) {
+        const httpsSpinner = ora('  申请 SSL 证书...').start();
+        const certResult = await runRemoteSilent(
+          ssh,
+          `certbot --nginx -d ${config.domain} --non-interactive --agree-tos --email admin@${config.domain} --redirect`
+        );
+        if (certResult.code === 0) {
+          httpsSpinner.succeed('HTTPS 证书申请成功');
+        } else {
+          httpsSpinner.warn('HTTPS 申请失败（可能是域名还没解析），可以之后手动运行 certbot');
+        }
       }
     }
 
@@ -503,14 +568,25 @@ export async function deployInit() {
   ssh.dispose();
 
   // 完成！
-  const accessUrl = domainAnswers.useHttps && domainAnswers.domain
-    ? `https://${config.domain}`
-    : domainAnswers.domain
-      ? `http://${config.domain}`
-      : `http://${config.host}:${config.port || 80}`;
-
   console.log(chalk.green.bold('\n🎉 部署成功！\n'));
-  console.log(`  访问地址：${chalk.cyan.underline(accessUrl)}`);
+
+  if (isWebService) {
+    const accessUrl = domainAnswers.useHttps && domainAnswers.domain
+      ? `https://${config.domain}`
+      : domainAnswers.domain
+        ? `http://${config.domain}`
+        : `http://${config.host}:${config.port || 80}`;
+    console.log(`  访问地址：${chalk.cyan.underline(accessUrl)}`);
+  } else if (appMode === 'cron') {
+    console.log(`  定时计划：${chalk.cyan(config.cronSchedule)}`);
+    console.log(`  日志查看：${chalk.cyan(`tail -f /var/log/${config.appName}.log`)}`);
+    console.log(`  修改计划：${chalk.gray('crontab -e')}`);
+  } else {
+    console.log(`  进程状态：${chalk.cyan(`supervisorctl status ${config.appName}`)}`);
+    console.log(`  输出日志：${chalk.cyan(`tail -f /var/log/${config.appName}.out.log`)}`);
+    console.log(`  错误日志：${chalk.cyan(`tail -f /var/log/${config.appName}.err.log`)}`);
+  }
+
   console.log(`  配置已保存至：${chalk.gray('.deploy-config.json')}`);
   console.log('\n后续操作：');
   console.log(`  更新代码 → ${chalk.cyan('deploy-helper update')}`);

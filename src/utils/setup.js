@@ -1,21 +1,24 @@
 // 返回在服务器上执行的 shell 命令数组
 export function getSetupCommands(config) {
-  const { projectType, nodeVersion = '20', pythonVersion = '3.11' } = config;
+  const { projectType, nodeVersion = '20', pythonVersion = '3.11', appMode = 'web' } = config;
   const steps = [];
 
-  // 通用：更新系统 & 安装 nginx
   steps.push({
     label: '更新系统包',
     cmd: 'apt-get update -qq',
   });
-  steps.push({
-    label: '安装 Nginx',
-    cmd: 'apt-get install -y -qq nginx',
-  });
-  steps.push({
-    label: '安装 Certbot（用于 HTTPS）',
-    cmd: 'apt-get install -y -qq certbot python3-certbot-nginx',
-  });
+
+  // Nginx 和 Certbot 只有 web 服务需要
+  if (appMode === 'web') {
+    steps.push({
+      label: '安装 Nginx',
+      cmd: 'apt-get install -y -qq nginx',
+    });
+    steps.push({
+      label: '安装 Certbot（用于 HTTPS）',
+      cmd: 'apt-get install -y -qq certbot python3-certbot-nginx',
+    });
+  }
 
   if (projectType === 'nodejs') {
     steps.push({
@@ -85,19 +88,43 @@ export function getSetupCommands(config) {
   return steps;
 }
 
+// 写入 crontab（幂等：先删除同名旧条目再添加）
+function buildCronEntry(appName, schedule, fullCmd) {
+  const marker = `deploy-helper:${appName}`;
+  const logFile = `/var/log/${appName}.log`;
+  return `(crontab -l 2>/dev/null | grep -v "${marker}"; echo "# ${marker}"; echo "${schedule} ${fullCmd} >> ${logFile} 2>&1") | crontab -`;
+}
+
 // 启动/重启应用的命令
 export function getStartCommands(config) {
-  const { projectType, remotePath, startCmd, appName, port, pythonVersion = '3.11', pythonFramework, pythonEnvManager = 'pip' } = config;
+  const {
+    projectType, remotePath, startCmd, appName, port,
+    pythonVersion = '3.11', pythonFramework, pythonEnvManager = 'pip',
+    appMode = 'web', cronSchedule,
+  } = config;
 
   if (projectType === 'nodejs') {
     const isNpmCmd = /^npm\s/.test(startCmd);
-    const pm2Target = isNpmCmd
-      ? `npm --name ${appName} -- ${startCmd.replace(/^npm\s+/, '')}`
-      : `${remotePath}/.start.sh --name ${appName} --interpreter bash`;
-
     const steps = [
       { label: '安装依赖', cmd: `cd ${remotePath} && npm install --production` },
     ];
+
+    if (appMode === 'cron') {
+      const cronFullCmd = `cd ${remotePath} && ${startCmd}`;
+      steps.push({
+        label: '写入定时任务（crontab）',
+        cmd: buildCronEntry(appName, cronSchedule, cronFullCmd),
+      });
+      steps.push({
+        label: '立即执行一次（验证）',
+        cmd: `${cronFullCmd} >> /var/log/${appName}.log 2>&1 || true`,
+      });
+      return steps;
+    }
+
+    const pm2Target = isNpmCmd
+      ? `npm --name ${appName} -- ${startCmd.replace(/^npm\s+/, '')}`
+      : `${remotePath}/.start.sh --name ${appName} --interpreter bash`;
 
     if (!isNpmCmd) {
       steps.push({
@@ -106,8 +133,13 @@ export function getStartCommands(config) {
       });
     }
 
+    // script 模式不自动重启（--no-autorestart）；web 模式正常重启
+    const pm2StartCmd = appMode === 'script'
+      ? `pm2 delete ${appName} 2>/dev/null || true && pm2 start ${pm2Target} --no-autorestart`
+      : `pm2 delete ${appName} 2>/dev/null || true && pm2 start ${pm2Target}`;
+
     steps.push(
-      { label: '启动应用（PM2）', cmd: `pm2 delete ${appName} 2>/dev/null || true && pm2 start ${pm2Target}` },
+      { label: `启动应用（PM2${appMode === 'script' ? '，不自动重启' : ''}）`, cmd: pm2StartCmd },
       { label: '设置 PM2 开机自启', cmd: `pm2 save && pm2 startup | tail -1 | bash || true` },
     );
 
@@ -119,11 +151,8 @@ export function getStartCommands(config) {
 
     if (pythonEnvManager === 'conda') {
       const condaBin = '/opt/miniconda3/bin/conda';
-      // conda run 直接以环境名激活，不修改 startCmd 本身
       const condaCmd = `${condaBin} run -n ${appName} --no-capture-output ${startCmd}`;
-      const supervisorConf = getSupervisorConfig({ appName, remotePath, venvCmd: condaCmd });
-
-      return [
+      const installSteps = [
         {
           label: '创建/更新 conda 环境',
           cmd: [
@@ -131,6 +160,29 @@ export function getStartCommands(config) {
             `|| ${condaBin} env create -f ${remotePath}/environment.yml -n ${appName}`,
           ].join(' '),
         },
+      ];
+
+      if (appMode === 'cron') {
+        return [
+          ...installSteps,
+          {
+            label: '写入定时任务（crontab）',
+            cmd: buildCronEntry(appName, cronSchedule, condaCmd),
+          },
+          {
+            label: '立即执行一次（验证）',
+            cmd: `${condaCmd} >> /var/log/${appName}.log 2>&1 || true`,
+          },
+        ];
+      }
+
+      // web 模式：autorestart=true；script 模式：autorestart=unexpected（崩溃才重启）
+      const supervisorConf = getSupervisorConfig({
+        appName, remotePath, venvCmd: condaCmd,
+        autorestart: appMode === 'script' ? 'unexpected' : 'true',
+      });
+      return [
+        ...installSteps,
         {
           label: '写入 supervisor 配置',
           cmd: `printf '${supervisorConf.replace(/'/g, "'\\''")}' > ${supervisorConfPath}`,
@@ -146,10 +198,8 @@ export function getStartCommands(config) {
     const pyBin = `python${pythonVersion}`;
     const venvPip = `${remotePath}/venv/bin/pip`;
     const venvCmd = startCmd.replace(/^(\S+)/, `${remotePath}/venv/bin/$1`);
-    const extraPkg = pythonFramework === 'fastapi' ? 'uvicorn' : 'gunicorn';
-    const supervisorConf = getSupervisorConfig({ appName, remotePath, venvCmd });
 
-    return [
+    const installSteps = [
       {
         label: '创建 Python 虚拟环境',
         cmd: `${pyBin} -m venv ${remotePath}/venv || python3 -m venv ${remotePath}/venv`,
@@ -158,10 +208,36 @@ export function getStartCommands(config) {
         label: '安装 Python 依赖',
         cmd: `cd ${remotePath} && ${venvPip} install -r requirements.txt -q`,
       },
-      {
+    ];
+
+    if (appMode === 'web') {
+      const extraPkg = pythonFramework === 'fastapi' ? 'uvicorn' : 'gunicorn';
+      installSteps.push({
         label: `安装 ${extraPkg}（WSGI/ASGI 服务器）`,
         cmd: `${venvPip} install ${extraPkg} -q`,
-      },
+      });
+    }
+
+    if (appMode === 'cron') {
+      return [
+        ...installSteps,
+        {
+          label: '写入定时任务（crontab）',
+          cmd: buildCronEntry(appName, cronSchedule, `cd ${remotePath} && ${venvCmd}`),
+        },
+        {
+          label: '立即执行一次（验证）',
+          cmd: `cd ${remotePath} && ${venvCmd} >> /var/log/${appName}.log 2>&1 || true`,
+        },
+      ];
+    }
+
+    const supervisorConf = getSupervisorConfig({
+      appName, remotePath, venvCmd,
+      autorestart: appMode === 'script' ? 'unexpected' : 'true',
+    });
+    return [
+      ...installSteps,
       {
         label: '写入 supervisor 配置',
         cmd: `printf '${supervisorConf.replace(/'/g, "'\\''")}' > ${supervisorConfPath}`,
@@ -217,13 +293,14 @@ export function getStartCommands(config) {
 }
 
 // 生成 supervisor 配置内容
-function getSupervisorConfig({ appName, remotePath, venvCmd }) {
+// autorestart: 'true'（始终重启）| 'unexpected'（仅崩溃时重启）| 'false'
+function getSupervisorConfig({ appName, remotePath, venvCmd, autorestart = 'true' }) {
   return [
     `[program:${appName}]`,
     `command=${venvCmd}`,
     `directory=${remotePath}`,
     `autostart=true`,
-    `autorestart=true`,
+    `autorestart=${autorestart}`,
     `stderr_logfile=/var/log/${appName}.err.log`,
     `stdout_logfile=/var/log/${appName}.out.log`,
     ``,
