@@ -52,8 +52,12 @@ export function getSetupCommands(config) {
       cmd: `curl -fsSL https://get.docker.com | sh`,
     });
     steps.push({
-      label: '安装 docker-compose',
+      label: '安装 docker-compose-plugin',
       cmd: `apt-get install -y -qq docker-compose-plugin`,
+    });
+    steps.push({
+      label: '设置 Docker 开机自启',
+      cmd: `systemctl enable docker && systemctl start docker`,
     });
   }
 
@@ -124,8 +128,36 @@ export function getStartCommands(config) {
   }
 
   if (projectType === 'docker') {
+    const { composeFile, appName, port } = config;
+
+    if (composeFile) {
+      const composeCmd = `docker compose -f ${composeFile}`;
+      return [
+        {
+          label: '拉取基础镜像（如有）',
+          cmd: `cd ${remotePath} && ${composeCmd} pull 2>/dev/null || true`,
+        },
+        {
+          label: '构建并启动容器',
+          cmd: `cd ${remotePath} && ${composeCmd} up -d --build --remove-orphans`,
+        },
+      ];
+    }
+
+    // 无 compose 文件：单容器模式
     return [
-      { label: '启动容器', cmd: `cd ${remotePath} && docker compose up -d --build` },
+      {
+        label: '构建 Docker 镜像',
+        cmd: `cd ${remotePath} && docker build -t ${appName} .`,
+      },
+      {
+        label: '启动容器',
+        cmd: [
+          `docker stop ${appName} 2>/dev/null || true`,
+          `docker rm ${appName} 2>/dev/null || true`,
+          `docker run -d --name ${appName} --restart unless-stopped -p ${port}:${port} ${appName}`,
+        ].join(' && '),
+      },
     ];
   }
 

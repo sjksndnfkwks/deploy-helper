@@ -128,3 +128,34 @@ export const PYTHON_FRAMEWORK_LABELS = {
   flask: 'Flask',
   other: '其他',
 };
+
+export function hasDockerfile(projectPath = process.cwd()) {
+  return fs.existsSync(path.join(projectPath, 'Dockerfile'));
+}
+
+export function detectComposeFile(projectPath = process.cwd()) {
+  for (const name of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+    if (fs.existsSync(path.join(projectPath, name))) return name;
+  }
+  return null;
+}
+
+// 从 Dockerfile EXPOSE 或 docker-compose ports 映射读取宿主机端口
+export function detectDockerPort(projectPath = process.cwd()) {
+  const dockerfilePath = path.join(projectPath, 'Dockerfile');
+  if (fs.existsSync(dockerfilePath)) {
+    const content = fs.readFileSync(dockerfilePath, 'utf-8');
+    const match = content.match(/^EXPOSE\s+(\d+)/m);
+    if (match) return { port: match[1], source: 'Dockerfile EXPOSE' };
+  }
+
+  const composeName = detectComposeFile(projectPath);
+  if (composeName) {
+    const content = fs.readFileSync(path.join(projectPath, composeName), 'utf-8');
+    // 匹配 "- 8080:3000" 或 "- '8080:3000'" 格式，取宿主机端口
+    const match = content.match(/^\s*-\s*["']?(\d+):\d+/m);
+    if (match) return { port: match[1], source: composeName };
+  }
+
+  return null;
+}

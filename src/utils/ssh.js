@@ -43,15 +43,18 @@ export async function runRemoteSilent(ssh, command) {
 }
 
 // 上传本地目录到服务器
-export async function uploadDirectory(ssh, localPath, remotePath, ora) {
+// uploadEnv: true 时允许上传 .env（Docker 场景用户显式确认后）
+export async function uploadDirectory(ssh, localPath, remotePath, { uploadEnv = false } = {}) {
+  const alwaysSkip = new Set(['node_modules', '.git', 'dist', '__pycache__', '.DS_Store', '.venv', 'venv']);
   const failed = [];
   await ssh.putDirectory(localPath, remotePath, {
     recursive: true,
     concurrency: 5,
     validate: (itemPath) => {
-      const base = itemPath.split('/').pop();
-      // 跳过不必要的目录
-      return !['node_modules', '.git', '.env', 'dist', '__pycache__', '.DS_Store'].includes(base);
+      const base = itemPath.split(/[\\/]/).pop();
+      if (alwaysSkip.has(base)) return false;
+      if (base === '.env' && !uploadEnv) return false;
+      return true;
     },
     tick: (localFile, remoteFile, error) => {
       if (error) failed.push(localFile);

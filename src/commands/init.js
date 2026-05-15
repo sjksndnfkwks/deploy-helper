@@ -5,9 +5,11 @@ import path from 'path';
 import os from 'os';
 import { connectSSH, runRemote, runRemoteSilent, uploadDirectory } from '../utils/ssh.js';
 import { saveConfig, loadConfig, configExists } from '../utils/config.js';
+import fs from 'fs';
 import {
   detectProjectType, detectNodeVersion, detectPythonFramework, detectPythonVersion,
   getNodeStartCommand, getPythonStartCommand,
+  hasDockerfile, detectComposeFile, detectDockerPort,
   PROJECT_TYPE_LABELS, PYTHON_FRAMEWORK_LABELS,
 } from '../utils/detect.js';
 import { getSetupCommands, getStartCommands, getNginxConfig } from '../utils/setup.js';
@@ -129,6 +131,7 @@ export async function deployInit() {
   let detectedNodeCmd = null;
   let detectedPyFramework = null;
   let detectedPyVersion = null;
+  let detectedDockerInfo = null;
 
   if (projectType === 'nodejs') {
     detectedNodeVer = detectNodeVersion();
@@ -156,6 +159,47 @@ export async function deployInit() {
     } else {
       info('未检测到 Python 版本要求（.python-version / pyproject.toml），将默认使用 3.11');
     }
+  }
+
+  if (projectType === 'docker') {
+    const dockerfileExists = hasDockerfile();
+    const composeFile = detectComposeFile();
+    const dockerPort = detectDockerPort();
+
+    if (!dockerfileExists) {
+      console.log(chalk.yellow('\n  ⚠ 未检测到 Dockerfile'));
+      console.log(chalk.gray('    Docker 部署需要 Dockerfile 或 docker-compose.yml。'));
+      console.log(chalk.gray('    如果你的语言/框架比较特殊（Java、C++、CUDA 等），'));
+      console.log(chalk.gray('    推荐用 Dockerfile 把运行环境完整封装，deploy-helper 只负责把它跑起来。'));
+    } else {
+      info('检测到 Dockerfile ✓');
+    }
+
+    if (composeFile) {
+      info(`检测到编排文件：${composeFile}（将使用 docker compose 启动）`);
+    } else {
+      info('未检测到 docker-compose 文件，将以单容器模式（docker build + docker run）启动');
+    }
+
+    if (dockerPort) {
+      info(`检测到容器映射端口：${dockerPort.port}（来源：${dockerPort.source}）`);
+    } else {
+      info('未从 Dockerfile/compose 文件中读取到端口，请手动填写');
+    }
+
+    const localEnvExists = fs.existsSync(path.join(process.cwd(), '.env'));
+    if (localEnvExists) {
+      console.log(chalk.gray('\n  本地存在 .env 文件（默认不上传，包含敏感信息请谨慎）'));
+    }
+
+    detectedDockerInfo = { dockerfileExists, composeFile, dockerPort, localEnvExists };
+  }
+
+  if (projectType === 'unknown') {
+    console.log(chalk.yellow('\n  提示：如果你的项目使用 Java、C++、Go、CUDA、conda 等环境，'));
+    console.log(chalk.gray('  推荐先写一个 Dockerfile 把运行环境封装好，再选择 Docker 类型部署。'));
+    console.log(chalk.gray('  这样 deploy-helper 不需要了解你的语言细节，只需要会跑 Docker 即可。'));
+    console.log(chalk.gray('  Dockerfile 入门：https://docs.docker.com/get-started/\n'));
   }
 
   // 第二步：让用户确认所有检测结果，port 在 startCmd 之前以便生成默认命令
@@ -196,9 +240,27 @@ export async function deployInit() {
     {
       type: 'input',
       name: 'port',
-      message: '应用监听的端口：',
-      default: () => projectType === 'python' ? '8000' : '3000',
+      message: '应用监听的端口（宿主机端口，Nginx 将代理到此）：',
+      default: () => {
+        if (projectType === 'docker') return detectedDockerInfo?.dockerPort?.port || '8080';
+        if (projectType === 'python') return '8000';
+        return '3000';
+      },
       when: () => ['nodejs', 'python', 'docker'].includes(projectType),
+    },
+    {
+      type: 'input',
+      name: 'composeFile',
+      message: 'docker-compose 文件名（留空则使用单容器模式）：',
+      default: detectedDockerInfo?.composeFile || '',
+      when: () => projectType === 'docker',
+    },
+    {
+      type: 'confirm',
+      name: 'uploadEnv',
+      message: '是否将本地 .env 文件上传到服务器？（包含数据库密码等敏感信息，请谨慎）',
+      default: false,
+      when: () => projectType === 'docker' && detectedDockerInfo?.localEnvExists,
     },
     {
       type: 'input',
@@ -281,8 +343,11 @@ export async function deployInit() {
   try {
     // 上传代码
     const uploadSpinner = ora('  上传项目文件...').start();
-    await uploadDirectory(ssh, process.cwd(), config.remotePath);
+    await uploadDirectory(ssh, process.cwd(), config.remotePath, { uploadEnv: !!config.uploadEnv });
     uploadSpinner.succeed('项目文件上传完成');
+    if (config.projectType === 'docker' && !config.uploadEnv && detectedDockerInfo?.localEnvExists) {
+      console.log(chalk.yellow('  ℹ .env 未上传，如需环境变量可在服务器手动创建：') + chalk.gray(` ${config.remotePath}/.env`));
+    }
 
     // 启动应用
     const startSteps = getStartCommands(config);
