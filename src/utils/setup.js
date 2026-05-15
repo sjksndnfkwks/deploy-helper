@@ -30,15 +30,20 @@ export function getSetupCommands(config) {
 
   if (projectType === 'python') {
     const pyBin = `python${pythonVersion}`;
+    // 先检查目标版本是否已存在，不存在才走 deadsnakes PPA 安装流程
     steps.push({
-      label: `安装 Python ${pythonVersion}`,
-      // deadsnakes PPA 支持指定版本；system python3 作为 fallback
+      label: `安装 Python ${pythonVersion}（如未安装）`,
       cmd: [
-        'apt-get install -y -qq software-properties-common',
-        'add-apt-repository -y ppa:deadsnakes/ppa',
-        'apt-get update -qq',
-        `apt-get install -y -qq ${pyBin} ${pyBin}-venv ${pyBin}-distutils || apt-get install -y -qq python3 python3-venv`,
-      ].join(' && '),
+        `command -v ${pyBin} >/dev/null 2>&1 || (`,
+        '  apt-get install -y -qq software-properties-common &&',
+        '  add-apt-repository -y ppa:deadsnakes/ppa &&',
+        '  apt-get update -qq &&',
+        `  apt-get install -y -qq ${pyBin} ${pyBin}-venv ${pyBin}-distutils`,
+        `  || apt-get install -y -qq python3 python3-venv`,
+        ')',
+        // 无论哪条路径，都确保 venv 包存在
+        `&& apt-get install -y -qq ${pyBin}-venv 2>/dev/null || apt-get install -y -qq python3-venv 2>/dev/null || true`,
+      ].join(' '),
     });
     steps.push({
       label: '安装 supervisor（进程管理）',
@@ -47,16 +52,17 @@ export function getSetupCommands(config) {
   }
 
   if (projectType === 'docker') {
+    // Docker 可能已预装（云服务商镜像常见），先检查再安装
     steps.push({
-      label: '安装 Docker',
-      cmd: `curl -fsSL https://get.docker.com | sh`,
+      label: '检查/安装 Docker',
+      cmd: `command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sh`,
     });
     steps.push({
-      label: '安装 docker-compose-plugin',
-      cmd: `apt-get install -y -qq docker-compose-plugin`,
+      label: '检查/安装 docker-compose-plugin',
+      cmd: `docker compose version >/dev/null 2>&1 || apt-get install -y -qq docker-compose-plugin`,
     });
     steps.push({
-      label: '设置 Docker 开机自启',
+      label: '确保 Docker 服务运行',
       cmd: `systemctl enable docker && systemctl start docker`,
     });
   }
