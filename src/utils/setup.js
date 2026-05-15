@@ -29,22 +29,37 @@ export function getSetupCommands(config) {
   }
 
   if (projectType === 'python') {
-    const pyBin = `python${pythonVersion}`;
-    // 先检查目标版本是否已存在，不存在才走 deadsnakes PPA 安装流程
-    steps.push({
-      label: `安装 Python ${pythonVersion}（如未安装）`,
-      cmd: [
-        `command -v ${pyBin} >/dev/null 2>&1 || (`,
-        '  apt-get install -y -qq software-properties-common &&',
-        '  add-apt-repository -y ppa:deadsnakes/ppa &&',
-        '  apt-get update -qq &&',
-        `  apt-get install -y -qq ${pyBin} ${pyBin}-venv ${pyBin}-distutils`,
-        `  || apt-get install -y -qq python3 python3-venv`,
-        ')',
-        // 无论哪条路径，都确保 venv 包存在
-        `&& apt-get install -y -qq ${pyBin}-venv 2>/dev/null || apt-get install -y -qq python3-venv 2>/dev/null || true`,
-      ].join(' '),
-    });
+    const { pythonEnvManager = 'pip' } = config;
+
+    if (pythonEnvManager === 'conda') {
+      // 安装 Miniconda 到固定路径，已存在则跳过
+      steps.push({
+        label: '安装 Miniconda（如未安装）',
+        cmd: [
+          'command -v /opt/miniconda3/bin/conda >/dev/null 2>&1 || (',
+          '  curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh &&',
+          '  bash /tmp/miniconda.sh -b -p /opt/miniconda3 &&',
+          '  rm /tmp/miniconda.sh',
+          ')',
+        ].join(' '),
+      });
+    } else {
+      const pyBin = `python${pythonVersion}`;
+      steps.push({
+        label: `安装 Python ${pythonVersion}（如未安装）`,
+        cmd: [
+          `command -v ${pyBin} >/dev/null 2>&1 || (`,
+          '  apt-get install -y -qq software-properties-common &&',
+          '  add-apt-repository -y ppa:deadsnakes/ppa &&',
+          '  apt-get update -qq &&',
+          `  apt-get install -y -qq ${pyBin} ${pyBin}-venv ${pyBin}-distutils`,
+          `  || apt-get install -y -qq python3 python3-venv`,
+          ')',
+          `&& apt-get install -y -qq ${pyBin}-venv 2>/dev/null || apt-get install -y -qq python3-venv 2>/dev/null || true`,
+        ].join(' '),
+      });
+    }
+
     steps.push({
       label: '安装 supervisor（进程管理）',
       cmd: 'apt-get install -y -qq supervisor',
@@ -72,7 +87,7 @@ export function getSetupCommands(config) {
 
 // 启动/重启应用的命令
 export function getStartCommands(config) {
-  const { projectType, remotePath, startCmd, appName, port, pythonVersion = '3.11', pythonFramework } = config;
+  const { projectType, remotePath, startCmd, appName, port, pythonVersion = '3.11', pythonFramework, pythonEnvManager = 'pip' } = config;
 
   if (projectType === 'nodejs') {
     const isNpmCmd = /^npm\s/.test(startCmd);
@@ -100,14 +115,39 @@ export function getStartCommands(config) {
   }
 
   if (projectType === 'python') {
+    const supervisorConfPath = `/etc/supervisor/conf.d/${appName}.conf`;
+
+    if (pythonEnvManager === 'conda') {
+      const condaBin = '/opt/miniconda3/bin/conda';
+      // conda run 直接以环境名激活，不修改 startCmd 本身
+      const condaCmd = `${condaBin} run -n ${appName} --no-capture-output ${startCmd}`;
+      const supervisorConf = getSupervisorConfig({ appName, remotePath, venvCmd: condaCmd });
+
+      return [
+        {
+          label: '创建/更新 conda 环境',
+          cmd: [
+            `${condaBin} env update -f ${remotePath}/environment.yml -n ${appName} --prune 2>/dev/null`,
+            `|| ${condaBin} env create -f ${remotePath}/environment.yml -n ${appName}`,
+          ].join(' '),
+        },
+        {
+          label: '写入 supervisor 配置',
+          cmd: `printf '${supervisorConf.replace(/'/g, "'\\''")}' > ${supervisorConfPath}`,
+        },
+        {
+          label: '启动应用（supervisor）',
+          cmd: `supervisorctl reread && supervisorctl update && (supervisorctl restart ${appName} 2>/dev/null || supervisorctl start ${appName})`,
+        },
+      ];
+    }
+
+    // pip + venv 路径
     const pyBin = `python${pythonVersion}`;
     const venvPip = `${remotePath}/venv/bin/pip`;
-    // 将 startCmd 的第一个词替换为 venv 内的可执行文件路径
     const venvCmd = startCmd.replace(/^(\S+)/, `${remotePath}/venv/bin/$1`);
-
     const extraPkg = pythonFramework === 'fastapi' ? 'uvicorn' : 'gunicorn';
     const supervisorConf = getSupervisorConfig({ appName, remotePath, venvCmd });
-    const supervisorConfPath = `/etc/supervisor/conf.d/${appName}.conf`;
 
     return [
       {

@@ -8,6 +8,7 @@ import { saveConfig, loadConfig, configExists } from '../utils/config.js';
 import fs from 'fs';
 import {
   detectProjectType, detectNodeVersion, detectPythonFramework, detectPythonVersion,
+  detectPythonEnvManager,
   getNodeStartCommand, getPythonStartCommand,
   hasDockerfile, detectComposeFile, detectDockerPort,
   PROJECT_TYPE_LABELS, PYTHON_FRAMEWORK_LABELS,
@@ -19,6 +20,81 @@ const step = (n, total, msg) =>
 
 const success = (msg) => console.log(chalk.green('  ✓ ') + msg);
 const info = (msg) => console.log(chalk.gray('  ℹ ') + msg);
+
+function showDockerTemplateGuide() {
+  console.log(chalk.yellow('\n  对于 Java、C++、Go、CUDA、conda 等环境，推荐 Docker 部署：'));
+  console.log(chalk.gray('  在项目根目录创建 Dockerfile，然后选择 Docker 类型，deploy-helper 负责把容器跑起来。\n'));
+
+  const templates = [
+    {
+      title: 'Python + conda / CUDA',
+      lines: [
+        'FROM continuumio/miniconda3',
+        'WORKDIR /app',
+        'COPY environment.yml .',
+        'RUN conda env create -f environment.yml -n myenv',
+        'COPY . .',
+        'CMD ["conda", "run", "-n", "myenv", "--no-capture-output", "python", "main.py"]',
+      ],
+    },
+    {
+      title: 'Java (Maven + JDK 21)',
+      lines: [
+        'FROM maven:3.9-eclipse-temurin-21-alpine AS build',
+        'WORKDIR /app',
+        'COPY pom.xml .',
+        'RUN mvn dependency:resolve -q',
+        'COPY src ./src',
+        'RUN mvn package -DskipTests -q',
+        'FROM eclipse-temurin:21-jre-alpine',
+        'COPY --from=build /app/target/*.jar app.jar',
+        'EXPOSE 8080',
+        'CMD ["java", "-jar", "app.jar"]',
+      ],
+    },
+    {
+      title: 'Go',
+      lines: [
+        'FROM golang:1.22-alpine AS build',
+        'WORKDIR /app',
+        'COPY go.mod go.sum ./',
+        'RUN go mod download',
+        'COPY . .',
+        'RUN go build -o main .',
+        'FROM alpine:latest',
+        'COPY --from=build /app/main .',
+        'EXPOSE 8080',
+        'CMD ["./main"]',
+      ],
+    },
+    {
+      title: 'Node.js（含构建步骤）',
+      lines: [
+        'FROM node:20-alpine AS build',
+        'WORKDIR /app',
+        'COPY package*.json ./',
+        'RUN npm ci',
+        'COPY . .',
+        'RUN npm run build',
+        'FROM node:20-alpine',
+        'WORKDIR /app',
+        'COPY --from=build /app/dist ./dist',
+        'COPY --from=build /app/node_modules ./node_modules',
+        'EXPOSE 3000',
+        'CMD ["node", "dist/index.js"]',
+      ],
+    },
+  ];
+
+  for (const { title, lines } of templates) {
+    console.log(chalk.bold(`  ── ${title} ─`));
+    for (const line of lines) {
+      console.log(chalk.gray('  │ ') + chalk.white(line));
+    }
+    console.log('');
+  }
+  console.log(chalk.gray('  写好 Dockerfile 后，重新运行 deploy-helper 并选择 Docker 类型即可。\n'));
+}
 
 export async function deployInit() {
   // 已有配置，询问是否覆盖
@@ -131,6 +207,7 @@ export async function deployInit() {
   let detectedNodeCmd = null;
   let detectedPyFramework = null;
   let detectedPyVersion = null;
+  let detectedPyEnvManager = null;
   let detectedDockerInfo = null;
 
   if (projectType === 'nodejs') {
@@ -148,11 +225,38 @@ export async function deployInit() {
   if (projectType === 'python') {
     detectedPyFramework = detectPythonFramework();
     detectedPyVersion = detectPythonVersion();
+    detectedPyEnvManager = detectPythonEnvManager();
+
+    // 依赖管理方式
+    if (detectedPyEnvManager === 'conda') {
+      const hasEnvYml = fs.existsSync(path.join(process.cwd(), 'environment.yml'));
+      if (hasEnvYml) {
+        info('检测到 conda 环境（environment.yml ✓）');
+      } else {
+        console.log(chalk.yellow('\n  ⚠ 检测到 conda 项目（conda-lock.yml），但未找到 environment.yml'));
+        console.log(chalk.gray('  部署需要 environment.yml 来在服务器上重建 conda 环境。'));
+        console.log(chalk.gray('  请在本地激活 conda 环境后运行：\n'));
+        console.log(chalk.cyan('    conda activate <你的环境名>'));
+        console.log(chalk.cyan('    conda env export > environment.yml\n'));
+        console.log(chalk.gray('  或者改用 Docker 部署（见下方模板），跳过这个问题。\n'));
+      }
+    } else if (detectedPyEnvManager === 'pip') {
+      info('检测到 pip 环境（requirements.txt ✓）');
+    } else {
+      console.log(chalk.yellow('\n  ⚠ 未找到 requirements.txt 或 environment.yml'));
+      console.log(chalk.gray('  部署时无法自动安装依赖，请先生成依赖文件：\n'));
+      console.log(chalk.gray('  conda 项目：'));
+      console.log(chalk.cyan('    conda activate <你的环境名>'));
+      console.log(chalk.cyan('    conda env export > environment.yml\n'));
+      console.log(chalk.gray('  pip 项目：'));
+      console.log(chalk.cyan('    pip freeze > requirements.txt\n'));
+      console.log(chalk.gray('  或者用 Docker 把整个环境封装进镜像（见下方模板）。\n'));
+    }
 
     if (detectedPyFramework) {
       info(`检测到 Python 框架：${PYTHON_FRAMEWORK_LABELS[detectedPyFramework]}（来源：requirements.txt）`);
     } else {
-      info('未在 requirements.txt 中检测到已知框架（FastAPI / Django / Flask），请手动确认启动命令');
+      info('未检测到已知 web 框架（FastAPI / Django / Flask），将按纯脚本处理');
     }
     if (detectedPyVersion) {
       info(`检测到 Python 版本：${detectedPyVersion.version}（来源：${detectedPyVersion.source}）`);
@@ -196,10 +300,7 @@ export async function deployInit() {
   }
 
   if (projectType === 'unknown') {
-    console.log(chalk.yellow('\n  提示：如果你的项目使用 Java、C++、Go、CUDA、conda 等环境，'));
-    console.log(chalk.gray('  推荐先写一个 Dockerfile 把运行环境封装好，再选择 Docker 类型部署。'));
-    console.log(chalk.gray('  这样 deploy-helper 不需要了解你的语言细节，只需要会跑 Docker 即可。'));
-    console.log(chalk.gray('  Dockerfile 入门：https://docs.docker.com/get-started/\n'));
+    showDockerTemplateGuide();
   }
 
   // 第二步：让用户确认所有检测结果，port 在 startCmd 之前以便生成默认命令
@@ -235,6 +336,17 @@ export async function deployInit() {
       name: 'pythonVersion',
       message: '确认 Python 版本（如 3.11）：',
       default: detectedPyVersion?.version || '3.11',
+      when: () => projectType === 'python',
+    },
+    {
+      type: 'list',
+      name: 'pythonEnvManager',
+      message: '确认依赖管理方式：',
+      default: detectedPyEnvManager || 'pip',
+      choices: [
+        { name: 'pip + venv（从 requirements.txt 安装）', value: 'pip' },
+        { name: 'conda（从 environment.yml 安装，服务器将安装 Miniconda）', value: 'conda' },
+      ],
       when: () => projectType === 'python',
     },
     {

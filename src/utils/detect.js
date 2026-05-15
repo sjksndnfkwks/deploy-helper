@@ -12,7 +12,10 @@ export function detectProjectType(projectPath = process.cwd()) {
     return 'nodejs';
   }
 
-  if (files.includes('requirements.txt') || files.includes('pyproject.toml') || files.includes('setup.py')) {
+  if (
+    files.includes('requirements.txt') || files.includes('pyproject.toml') ||
+    files.includes('setup.py') || files.includes('environment.yml') || files.includes('conda-lock.yml')
+  ) {
     return 'python';
   }
 
@@ -47,6 +50,19 @@ export function detectNodeVersion(projectPath = process.cwd()) {
     }
   }
 
+  return null;
+}
+
+// 检测 Python 依赖管理方式：conda（environment.yml）或 pip（requirements.txt）
+export function detectPythonEnvManager(projectPath = process.cwd()) {
+  if (
+    fs.existsSync(path.join(projectPath, 'environment.yml')) ||
+    fs.existsSync(path.join(projectPath, 'conda-lock.yml'))
+  ) return 'conda';
+  if (
+    fs.existsSync(path.join(projectPath, 'requirements.txt')) ||
+    fs.existsSync(path.join(projectPath, 'pyproject.toml'))
+  ) return 'pip';
   return null;
 }
 
@@ -106,12 +122,15 @@ export function getNodeStartCommand(projectPath = process.cwd()) {
   return { cmd: 'node index.js', source: '默认值' };
 }
 
-// 根据框架生成 Python 启动命令
-export function getPythonStartCommand(framework, appName, port) {
+// 根据框架生成 Python 启动命令；framework 为 other 时扫描常见入口文件
+export function getPythonStartCommand(framework, appName, port, projectPath = process.cwd()) {
   if (framework === 'fastapi') return `uvicorn main:app --host 0.0.0.0 --port ${port}`;
   if (framework === 'django') return `gunicorn ${appName}.wsgi:application --bind 0.0.0.0:${port}`;
   if (framework === 'flask') return `gunicorn app:app --bind 0.0.0.0:${port}`;
-  return 'python app.py';
+  for (const file of ['main.py', 'app.py', 'run.py', 'server.py', 'manage.py']) {
+    if (fs.existsSync(path.join(projectPath, file))) return `python ${file}`;
+  }
+  return 'python main.py';
 }
 
 export const PROJECT_TYPE_LABELS = {

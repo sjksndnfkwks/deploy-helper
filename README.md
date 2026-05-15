@@ -64,13 +64,28 @@ deploy-helper
 
 ### Python
 
-自动检测：`.python-version` / `pyproject.toml` → Python 版本；`requirements.txt` → 框架（FastAPI / Django / Flask）→ 推荐启动命令。
+自动检测：`.python-version` / `pyproject.toml` → Python 版本；`requirements.txt` → 框架（FastAPI / Django / Flask）→ 推荐启动命令；`environment.yml` / `conda-lock.yml` → conda 模式。
 
-- 服务器无 Python 时自动安装（通过 deadsnakes PPA，支持 3.8–3.13）
-- 已有对应版本则跳过安装
-- 依赖隔离：自动创建 **virtualenv**，所有包装在 `venv/` 内，不污染系统
-- 进程管理：**supervisor**（自动重启、开机自启、日志归档）
-- 根据框架自动选择服务器：FastAPI → uvicorn；Django / Flask → gunicorn
+进程管理：**supervisor**（自动重启、开机自启、日志写入 `/var/log/<appname>.out.log`）
+
+**pip 模式**（有 `requirements.txt`）
+- 服务器无 Python 时自动安装（deadsnakes PPA，支持 3.8–3.13），已有则跳过
+- 自动创建 virtualenv，所有包装在 `venv/` 内
+- FastAPI → uvicorn；Django / Flask → gunicorn
+
+**conda 模式**（有 `environment.yml`）
+- 服务器自动安装 Miniconda 到 `/opt/miniconda3`，已有则跳过
+- 从 `environment.yml` 创建 conda 环境（`conda env create -n <appname>`），二次部署时 `--prune` 增量更新
+- 启动命令通过 `conda run -n <appname>` 执行，无需 `conda activate`
+
+**本地生成 environment.yml**
+
+```bash
+conda activate <你的环境名>
+conda env export > environment.yml
+```
+
+> 如果环境包含 CUDA / cudatoolkit 等系统级包，建议改用 Docker 方案（见下文），避免服务器 GPU 驱动版本不一致。
 
 ### Docker
 
@@ -100,9 +115,47 @@ deploy-helper
 
 ## 对于不在列表里的语言
 
-> Java、C++、CUDA、R、Fortran……
+> Java、C++、Go、Rust、CUDA、R……
 
-推荐路线：先写 Dockerfile，把运行环境完整封装进镜像，然后选 Docker 类型部署。deploy-helper 不需要了解你的语言细节，只负责把容器跑起来。
+推荐路线：写 Dockerfile 把运行环境封装进镜像，然后选 Docker 类型。deploy-helper 不需要了解你的语言细节，只负责把容器跑起来。选择 `其他` 类型时，工具会在终端直接展示以下模板：
+
+**Python + conda / CUDA**
+```dockerfile
+FROM continuumio/miniconda3
+WORKDIR /app
+COPY environment.yml .
+RUN conda env create -f environment.yml -n myenv
+COPY . .
+CMD ["conda", "run", "-n", "myenv", "--no-capture-output", "python", "main.py"]
+```
+
+**Java（Maven + JDK 21）**
+```dockerfile
+FROM maven:3.9-eclipse-temurin-21-alpine AS build
+WORKDIR /app
+COPY pom.xml .
+RUN mvn dependency:resolve -q
+COPY src ./src
+RUN mvn package -DskipTests -q
+FROM eclipse-temurin:21-jre-alpine
+COPY --from=build /app/target/*.jar app.jar
+EXPOSE 8080
+CMD ["java", "-jar", "app.jar"]
+```
+
+**Go**
+```dockerfile
+FROM golang:1.22-alpine AS build
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go build -o main .
+FROM alpine:latest
+COPY --from=build /app/main .
+EXPOSE 8080
+CMD ["./main"]
+```
 
 Dockerfile 入门：https://docs.docker.com/get-started/
 
