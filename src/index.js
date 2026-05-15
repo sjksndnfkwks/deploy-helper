@@ -8,12 +8,12 @@ import { deployRollback } from './commands/rollback.js';
 import { deployEnv } from './commands/env.js';
 import { deployBackup } from './commands/backup.js';
 
-console.log(chalk.cyan.bold('\n🚀 deploy-helper') + chalk.gray(' v0.2.0 — 把项目部署到服务器，就这么简单\n'));
+console.log(chalk.cyan.bold('\n🚀 deploy-helper') + chalk.gray(' v0.2.1 — 把项目部署到服务器，就这么简单\n'));
 
 program
   .name('deploy-helper')
   .description('交互式部署工具，帮你把项目从本地跑到任意 VPS 服务器上')
-  .version('0.2.0');
+  .version('0.2.1');
 
 program
   .command('init')
