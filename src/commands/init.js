@@ -121,24 +121,45 @@ export async function deployInit() {
   // ── Step 1: 服务器信息 ──────────────────────────────────────────
   step(1, 5, '服务器连接信息');
 
+  // 允许粘贴 SSH 连接命令自动解析
+  const { sshString } = await inquirer.prompt([{
+    type: 'input',
+    name: 'sshString',
+    message: '（可选）粘贴 SSH 连接命令自动填充，或直接回车手动填写：',
+    default: '',
+  }]);
+
+  let sshDefaults = { host: '', port: '22', user: 'root' };
+  if (sshString.trim()) {
+    // 支持：ssh user@host -p port  /  user@host  /  host
+    const m = sshString.trim().match(/^(?:ssh\s+)?(?:([^@\s]+)@)?([\w][\w.-]*)(?:\s+-p\s+(\d+))?/i);
+    if (m && m[2]) {
+      sshDefaults = { host: m[2], port: m[3] || '22', user: m[1] || 'root' };
+      console.log(chalk.gray(`  解析结果 → 用户: ${chalk.white(sshDefaults.user)}  主机: ${chalk.white(sshDefaults.host)}  端口: ${chalk.white(sshDefaults.port)}\n`));
+    } else {
+      console.log(chalk.yellow('  无法解析该格式，请手动填写。\n'));
+    }
+  }
+
   const serverAnswers = await inquirer.prompt([
     {
       type: 'input',
       name: 'host',
-      message: '服务器 IP 地址：',
-      validate: (v) => v.trim() ? true : '请输入 IP 地址',
+      message: '服务器地址（IP 或域名）：',
+      default: sshDefaults.host || undefined,
+      validate: (v) => v.trim() ? true : '请输入服务器地址',
     },
     {
       type: 'input',
       name: 'port',
       message: 'SSH 端口：',
-      default: '22',
+      default: sshDefaults.port,
     },
     {
       type: 'input',
       name: 'user',
       message: '登录用户名：',
-      default: 'root',
+      default: sshDefaults.user,
     },
     {
       type: 'list',

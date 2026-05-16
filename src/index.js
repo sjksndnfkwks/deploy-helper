@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { program } from 'commander';
 import chalk from 'chalk';
+import { createRequire } from 'module';
 import { deployInit } from './commands/init.js';
 import { deployUpdate, manageServers } from './commands/update.js';
 import { deployStatus } from './commands/status.js';
@@ -8,12 +9,33 @@ import { deployRollback } from './commands/rollback.js';
 import { deployEnv } from './commands/env.js';
 import { deployBackup } from './commands/backup.js';
 
-console.log(chalk.cyan.bold('\n🚀 deploy-helper') + chalk.gray(' v0.2.1 — 把项目部署到服务器，就这么简单\n'));
+const require = createRequire(import.meta.url);
+const { version } = require('../package.json');
+
+console.log(chalk.cyan.bold('\n🚀 deploy-helper') + chalk.gray(` v${version} — 把项目部署到服务器，就这么简单\n`));
+
+// Ctrl+C 中断 inquirer 交互时优雅退出，不显示堆栈
+function onExitPromptError(err) {
+  if (err && err.constructor?.name === 'ExitPromptError') {
+    console.log(chalk.gray('\n已取消。\n'));
+    process.exit(0);
+  }
+}
+process.on('uncaughtException', (err) => {
+  onExitPromptError(err);
+  console.error(err);
+  process.exit(1);
+});
+process.on('unhandledRejection', (err) => {
+  onExitPromptError(err);
+  console.error(err);
+  process.exit(1);
+});
 
 program
   .name('deploy-helper')
   .description('交互式部署工具，帮你把项目从本地跑到任意 VPS 服务器上')
-  .version('0.2.1');
+  .version(version);
 
 program
   .command('init')

@@ -17,7 +17,7 @@ npx @zhengyizhao/deploy-helper init
 Or install globally:
 
 ```bash
-npm install -g @zhengyizhao/deploy-helper
+npm i -g @zhengyizhao/deploy-helper
 deploy-helper init
 ```
 
@@ -302,7 +302,7 @@ npx @zhengyizhao/deploy-helper init
 或全局安装后使用：
 
 ```bash
-npm install -g @zhengyizhao/deploy-helper
+npm i -g @zhengyizhao/deploy-helper
 deploy-helper init
 ```
 
