@@ -1,6 +1,6 @@
 {
   "name": "@zhengyizhao/deploy-helper",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Interactive CLI to deploy your project to any VPS server",
   "main": "index.js",
   "scripts": {

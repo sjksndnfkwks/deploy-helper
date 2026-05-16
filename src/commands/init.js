@@ -194,10 +194,22 @@ export async function deployInit() {
     spinner.succeed(chalk.green('服务器连接成功！'));
   } catch (err) {
     spinner.fail(chalk.red('连接失败：' + err.message));
+    const port = serverAnswers.port || 22;
     console.log(chalk.yellow('\n排查建议：'));
-    console.log('  • 检查 IP 和端口是否正确');
-    console.log('  • 确认服务器安全组已开放 22 端口');
-    console.log('  • 如用密钥登录，确认密钥路径和权限（chmod 600）');
+    if (err.code === 'ECONNREFUSED') {
+      console.log(`  • 端口 ${port} 拒绝连接——确认 SSH 服务正在运行且监听该端口`);
+      console.log('  • 检查服务器防火墙/安全组是否放行该端口');
+      console.log('  • 如果是云平台（Featurize / AutoDL 等），确认实例正在运行');
+    } else if (err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET') {
+      console.log(`  • 连接超时——服务器或防火墙未响应端口 ${port}`);
+      console.log('  • 确认安全组/iptables 已放行该端口的入站流量');
+    } else {
+      console.log(`  • 检查服务器地址（${serverAnswers.host}）和端口（${port}）是否正确`);
+      console.log('  • 确认服务器防火墙已放行 SSH 端口');
+    }
+    if (serverAnswers.authType === 'key') {
+      console.log('  • 密钥登录：确认密钥路径正确且权限为 600（chmod 600 ~/.ssh/id_rsa）');
+    }
     return;
   }
 
