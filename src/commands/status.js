@@ -1,7 +1,7 @@
 import chalk from 'chalk';
 import ora from 'ora';
 import { connectSSH, runRemoteSilent } from '../utils/ssh.js';
-import { loadConfig } from '../utils/config.js';
+import { loadConfig, resolveCredentials } from '../utils/config.js';
 
 export async function deployStatus() {
   const config = loadConfig();
@@ -10,6 +10,8 @@ export async function deployStatus() {
     console.log(chalk.red('\n没有找到部署配置，请先运行：') + chalk.cyan(' deploy-helper init\n'));
     return;
   }
+
+  await resolveCredentials(config);
 
   let ssh;
   const spinner = ora('连接服务器获取状态...').start();
@@ -200,6 +202,7 @@ function printLogLines(stdout) {
 }
 
 function formatUptime(timestamp) {
+  if (!timestamp || isNaN(timestamp)) return '未知';
   const ms = Date.now() - timestamp;
   const h = Math.floor(ms / 3600000);
   const m = Math.floor((ms % 3600000) / 60000);

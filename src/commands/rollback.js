@@ -2,7 +2,7 @@ import chalk from 'chalk';
 import ora from 'ora';
 import inquirer from 'inquirer';
 import { connectSSH, runRemoteSilent, runRemoteStrict } from '../utils/ssh.js';
-import { loadConfig } from '../utils/config.js';
+import { loadConfig, resolveCredentials } from '../utils/config.js';
 import { getStartCommands, getStopCommand, getHealthCheck } from '../utils/setup.js';
 
 const SNAPSHOTS_DIR = '/var/deploy-helper/snapshots';
@@ -22,8 +22,10 @@ export async function createSnapshot(ssh, config) {
   const exists = await runRemoteSilent(ssh, `test -d ${config.remotePath} && echo yes || echo no`);
   if (exists.stdout.trim() === 'yes') {
     // 排除大目录（venv / node_modules）节省空间
-    await runRemoteSilent(
+    // 用 strict：rsync 失败（如未安装）必须抛错，否则会留下空快照 —— 之后回滚 --delete 会清空部署目录
+    await runRemoteStrict(
       ssh,
+      `command -v rsync >/dev/null 2>&1 || apt-get install -y -qq rsync; ` +
       `rsync -a --exclude=venv --exclude=node_modules --exclude=__pycache__ ${config.remotePath}/ ${snapshotPath}/`
     );
 
@@ -124,6 +126,8 @@ export async function deployRollback() {
     return;
   }
 
+  await resolveCredentials(config);
+
   let ssh;
   const spinner = ora('连接服务器...').start();
   try {
@@ -199,8 +203,17 @@ export async function deployRollback() {
 
     // 替换代码目录（保留 venv —— 快照排除了它，避免误删环境）
     const restoreSpinner = ora(`还原版本 ${selectedSnapshot}...`).start();
-    // 保留 venv / node_modules，只覆盖代码部分
-    await runRemoteSilent(
+    // 还原前先确认快照非空，避免 rsync --delete 把部署目录清空
+    const snapCheck = await runRemoteSilent(
+      ssh,
+      `find ${SNAPSHOTS_DIR}/${selectedSnapshot} -type f -not -name .snapshot-meta.json | head -1`
+    );
+    if (!snapCheck.stdout.trim()) {
+      restoreSpinner.fail('所选快照为空，已中止还原以防数据丢失');
+      throw new Error(`快照 ${selectedSnapshot} 不含任何文件`);
+    }
+    // 保留 venv / node_modules，只覆盖代码部分；strict：还原失败必须抛错
+    await runRemoteStrict(
       ssh,
       `rsync -a --delete --exclude=venv --exclude=node_modules ${SNAPSHOTS_DIR}/${selectedSnapshot}/ ${config.remotePath}/`
     );

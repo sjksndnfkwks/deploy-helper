@@ -3,36 +3,10 @@ import ora from 'ora';
 import inquirer from 'inquirer';
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
 import { connectSSH, runRemoteSilent } from '../utils/ssh.js';
-import { loadConfig } from '../utils/config.js';
+import { loadConfig, resolveCredentials } from '../utils/config.js';
 
 const ENV_BACKUP_DIR = '/var/deploy-helper/env-backups';
-
-/**
- * 简单对称加密（AES-256-GCM），用于传输时保护内容
- */
-function encryptContent(text, key) {
-  const salt = crypto.randomBytes(16);
-  const derivedKey = crypto.scryptSync(key, salt, 32);
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', derivedKey, iv);
-  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return Buffer.concat([salt, iv, tag, encrypted]).toString('base64');
-}
-
-function decryptContent(encryptedBase64, key) {
-  const data = Buffer.from(encryptedBase64, 'base64');
-  const salt = data.slice(0, 16);
-  const iv = data.slice(16, 28);
-  const tag = data.slice(28, 44);
-  const encrypted = data.slice(44);
-  const derivedKey = crypto.scryptSync(key, salt, 32);
-  const decipher = crypto.createDecipheriv('aes-256-gcm', derivedKey, iv);
-  decipher.setAuthTag(tag);
-  return decipher.update(encrypted) + decipher.final('utf8');
-}
 
 /**
  * 解析 .env 文件，返回键值对数组（过滤注释和空行）
@@ -73,6 +47,8 @@ export async function deployEnv() {
     console.log(chalk.red('\n没有找到部署配置，请先运行：') + chalk.cyan(' deploy-helper init\n'));
     return;
   }
+
+  await resolveCredentials(config);
 
   // 检查本地 .env 是否存在
   const localEnvPath = path.join(process.cwd(), '.env');
@@ -146,10 +122,15 @@ async function pushEnv(config, envContent, vars) {
     );
     backupSpinner.succeed('已备份旧 .env');
 
-    // 上传新 .env（通过 SSH 直接写入，不走文件上传避免明文落盘）
+    // 上传新 .env：base64 编码后在服务器解码，彻底避开 shell 转义/heredoc sentinel 问题
     const uploadSpinner = ora('上传 .env 到服务器...').start();
-    const escaped = envContent.replace(/'/g, "'\\''");
-    await runRemoteSilent(ssh, `cat > ${config.remotePath}/.env << 'DEPLOY_HELPER_EOF'\n${escaped}\nDEPLOY_HELPER_EOF`);
+    const b64 = Buffer.from(envContent, 'utf-8').toString('base64');
+    const writeResult = await runRemoteSilent(ssh, `echo '${b64}' | base64 -d > ${config.remotePath}/.env`);
+    if (writeResult.code !== 0) {
+      uploadSpinner.fail('上传失败：' + (writeResult.stderr || '写入 .env 出错'));
+      ssh.dispose();
+      return;
+    }
     await runRemoteSilent(ssh, `chmod 600 ${config.remotePath}/.env`);
     uploadSpinner.succeed('.env 上传完成，权限已设为 600');
 

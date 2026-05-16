@@ -332,6 +332,20 @@ export async function deployInit() {
       name: 'remotePath',
       message: '部署到服务器的路径：',
       default: `/var/www/${appName}`,
+      validate: (v) => {
+        const t = v.trim();
+        if (!t.startsWith('/')) return '请输入绝对路径（以 / 开头）';
+        if (/[^a-zA-Z0-9._/-]/.test(t)) return '路径只能包含字母、数字和 . _ - / 字符';
+        return true;
+      },
+    },
+    {
+      type: 'input',
+      name: 'staticDir',
+      message: '站点根目录（构建产物所在子目录，如 dist / build；留空表示项目根目录）：',
+      default: '',
+      when: () => projectType === 'static',
+      validate: (v) => /^[a-zA-Z0-9._/-]*$/.test(v.trim()) ? true : '只能包含字母、数字和 . _ - / 字符',
     },
     {
       type: 'input',
@@ -470,7 +484,12 @@ export async function deployInit() {
         name: 'domain',
         message: '你的域名（如 example.com）：',
         when: (a) => a.useDomain,
-        validate: (v) => v.trim() ? true : '请输入域名',
+        validate: (v) => {
+          const t = v.trim();
+          if (!t) return '请输入域名';
+          if (!/^[a-zA-Z0-9.-]+$/.test(t)) return '域名只能包含字母、数字、点和连字符';
+          return true;
+        },
       },
       {
         type: 'confirm',

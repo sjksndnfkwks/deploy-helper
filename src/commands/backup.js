@@ -3,9 +3,14 @@ import ora from 'ora';
 import inquirer from 'inquirer';
 import path from 'path';
 import { connectSSH, runRemoteSilent } from '../utils/ssh.js';
-import { loadConfig, saveConfig } from '../utils/config.js';
+import { loadConfig, saveConfig, resolveCredentials } from '../utils/config.js';
 
 const BACKUP_BASE = '/var/deploy-helper/db-backups';
+
+// POSIX 单引号转义：密码/用户名含 ' $ 等特殊字符时也能安全拼进 shell 命令
+function shellQuote(str) {
+  return `'` + String(str ?? '').replace(/'/g, `'\\''`) + `'`;
+}
 
 /**
  * 根据数据库类型生成备份命令。
@@ -18,17 +23,17 @@ function buildDumpCommand(dbConfig, outputFile, passwordEnvInline = true) {
 
   if (type === 'mysql') {
     const p = port || 3306;
-    const pwd = passwordEnvInline ? `MYSQL_PWD='${password}' ` : '';
+    const pwd = passwordEnvInline ? `MYSQL_PWD=${shellQuote(password)} ` : '';
     return `${pwd}mysqldump -h ${h} -P ${p} -u ${user} ${database} > ${outputFile}`;
   }
   if (type === 'postgresql') {
     const p = port || 5432;
-    const pwd = passwordEnvInline ? `PGPASSWORD='${password}' ` : '';
+    const pwd = passwordEnvInline ? `PGPASSWORD=${shellQuote(password)} ` : '';
     return `${pwd}pg_dump -h ${h} -p ${p} -U ${user} ${database} > ${outputFile}`;
   }
   if (type === 'mongodb') {
     const p = port || 27017;
-    const auth = password ? `--username ${user} --password '${password}' --authenticationDatabase admin` : '';
+    const auth = password ? `--username ${user} --password ${shellQuote(password)} --authenticationDatabase admin` : '';
     return `mongodump --host ${h} --port ${p} ${auth} --db ${database} --archive=${outputFile} --gzip`;
   }
   return null;
@@ -58,6 +63,8 @@ export async function deployBackup() {
     console.log(chalk.red('\n没有找到部署配置，请先运行：') + chalk.cyan(' deploy-helper init\n'));
     return;
   }
+
+  await resolveCredentials(config);
 
   const { action } = await inquirer.prompt([{
     type: 'list',
@@ -104,9 +111,13 @@ async function doBackup(config, silent = false) {
     ]);
     dbConfig = answers;
 
-    // 保存到 config
+    // 保存到 config（saveConfig 会自动剥离密码，不落盘）
     const updated = { ...config, database: dbConfig };
     saveConfig(updated);
+  } else if (dbConfig.password === undefined) {
+    // 已有数据库配置但密码未落盘，按需补齐
+    await resolveCredentials(config, { needDatabase: true });
+    dbConfig = config.database;
   }
 
   let ssh;
@@ -260,6 +271,15 @@ async function scheduleBackup(config) {
     cronExpr = custom;
   }
 
+  if (!config.database) {
+    console.log(chalk.red('\n未配置数据库信息，请先运行一次备份完成配置。\n'));
+    return;
+  }
+  // 数据库密码不落盘，写凭据文件前先补齐
+  if (config.database.password === undefined) {
+    await resolveCredentials(config, { needDatabase: true });
+  }
+
   let ssh;
   const spinner = ora('配置定时备份...').start();
   try {
@@ -283,9 +303,9 @@ async function scheduleBackup(config) {
     // 凭据文件单独存放，权限 600；脚本通过 . credentials.sh 加载
     const credPath = `/etc/deploy-helper/${config.appName}.creds`;
     const credContent = (() => {
-      if (dbConfig.type === 'mysql') return `export MYSQL_PWD='${dbConfig.password}'\n`;
-      if (dbConfig.type === 'postgresql') return `export PGPASSWORD='${dbConfig.password}'\n`;
-      if (dbConfig.type === 'mongodb') return `export DH_MONGO_USER='${dbConfig.user}'\nexport DH_MONGO_PWD='${dbConfig.password}'\n`;
+      if (dbConfig.type === 'mysql') return `export MYSQL_PWD=${shellQuote(dbConfig.password)}\n`;
+      if (dbConfig.type === 'postgresql') return `export PGPASSWORD=${shellQuote(dbConfig.password)}\n`;
+      if (dbConfig.type === 'mongodb') return `export DH_MONGO_USER=${shellQuote(dbConfig.user)}\nexport DH_MONGO_PWD=${shellQuote(dbConfig.password)}\n`;
       return '';
     })();
 

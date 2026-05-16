@@ -50,7 +50,7 @@ program
   .description('服务器管理：查看、添加、删除多台服务器')
   .action(manageServers);
 
-// 无命令时显示帮助 + 进入 init
+// 无命令时显示帮助
 if (process.argv.length === 2) {
   console.log(chalk.bold('可用命令：\n'));
   console.log(`  ${chalk.cyan('init')}      首次部署，全程引导`);

@@ -2,37 +2,46 @@ import chalk from 'chalk';
 import ora from 'ora';
 import inquirer from 'inquirer';
 import { connectSSH, runRemoteSilent, runRemoteStrict, uploadDirectory } from '../utils/ssh.js';
-import { loadConfig, saveConfig } from '../utils/config.js';
+import { loadConfig, saveConfig, resolveCredentials } from '../utils/config.js';
 import { createSnapshot } from './rollback.js';
 import { doBackup } from './backup.js';
 import { getStartCommands, getHealthCheck } from '../utils/setup.js';
+
+// quiet 模式（并行部署）下返回 no-op，避免多个 ora spinner 同时写 stdout 互相覆盖
+function makeSpinner(quiet, text) {
+  if (quiet) {
+    const noop = () => {};
+    return { succeed: noop, fail: noop, warn: noop, info: noop, stop: noop };
+  }
+  return ora(text).start();
+}
 
 /**
  * 对单台服务器执行部署流程
  *
  * 流程：连接 → 快照 → 上传代码 → 复用 init 的 getStartCommands → 健康检查
  *
- * 兼容性：旧版 config 没有 appMode 字段时，根据 projectType + domain 推断：
- *   - 有 domain 或 projectType=static → web
- *   - 否则 → script（保守起见）
+ * quiet=true（并行部署时）：不显示逐步 spinner，仅在开始/结束各打印一行汇总
  */
-async function deployToServer(serverConfig) {
+async function deployToServer(serverConfig, quiet = false) {
   const label = serverConfig.label ? chalk.cyan(`[${serverConfig.label}] `) : '';
   const cfg = normalizeConfig(serverConfig);
+  if (quiet) console.log(chalk.gray(`  → 开始部署 ${serverConfig.label || cfg.host}...`));
 
   let ssh;
-  const connectSpinner = ora(`${label}连接服务器 ${cfg.host}...`).start();
+  const connectSpinner = makeSpinner(quiet, `${label}连接服务器 ${cfg.host}...`);
   try {
     ssh = await connectSSH(cfg);
     connectSpinner.succeed(`${label}连接成功`);
   } catch (err) {
     connectSpinner.fail(`${label}连接失败：${err.message}`);
+    if (quiet) console.log(chalk.red(`  ✗ ${serverConfig.label || cfg.host} 连接失败：${err.message.split('\n')[0]}`));
     return false;
   }
 
   try {
     // 1. 创建快照（部署前备份当前版本）
-    const snapSpinner = ora(`${label}创建版本快照...`).start();
+    const snapSpinner = makeSpinner(quiet, `${label}创建版本快照...`);
     const snapName = await createSnapshot(ssh, cfg);
     if (snapName) {
       snapSpinner.succeed(`${label}快照已创建：${chalk.gray(snapName)}`);
@@ -41,7 +50,7 @@ async function deployToServer(serverConfig) {
     }
 
     // 2. 上传代码（static 不跳 dist，并透传 uploadEnv）
-    const uploadSpinner = ora(`${label}上传代码...`).start();
+    const uploadSpinner = makeSpinner(quiet, `${label}上传代码...`);
     const skipPatterns = cfg.projectType === 'static'
       ? ['node_modules', '.git', '__pycache__', '.DS_Store', '.venv', 'venv']
       : undefined;
@@ -54,7 +63,7 @@ async function deployToServer(serverConfig) {
     // 3. 复用 init 的启动命令（保证 update 与 init 行为一致）
     const startSteps = getStartCommands(cfg);
     for (const s of startSteps) {
-      const sp = ora(`${label}${s.label}...`).start();
+      const sp = makeSpinner(quiet, `${label}${s.label}...`);
       try {
         await runRemoteStrict(ssh, s.cmd);
         sp.succeed(`${label}${s.label}`);
@@ -67,7 +76,7 @@ async function deployToServer(serverConfig) {
     // 4. 健康检查
     const health = getHealthCheck(cfg);
     if (health) {
-      const hSpinner = ora(`${label}验证服务运行状态...`).start();
+      const hSpinner = makeSpinner(quiet, `${label}验证服务运行状态...`);
       await runRemoteSilent(ssh, 'sleep 2');
       const result = await runRemoteSilent(ssh, health.cmd);
       const parsed = health.parse(result);
@@ -75,16 +84,21 @@ async function deployToServer(serverConfig) {
         hSpinner.succeed(`${label}服务正常 — ${chalk.gray(parsed.detail)}`);
       } else {
         hSpinner.warn(`${label}健康检查未通过 — ${chalk.yellow(parsed.detail)}`);
-        console.log(chalk.gray(`  ${label}如服务异常，可运行 deploy-helper rollback 回滚`));
+        if (!quiet) console.log(chalk.gray(`  ${label}如服务异常，可运行 deploy-helper rollback 回滚`));
       }
     }
 
     ssh.dispose();
+    if (quiet) console.log(chalk.green(`  ✓ ${serverConfig.label || cfg.host} 部署成功`));
     return true;
 
   } catch (err) {
-    console.log(chalk.red(`\n${label}部署失败：${err.message}`));
-    console.log(chalk.gray(`  运行 ${chalk.cyan('deploy-helper rollback')} 可恢复上一个版本`));
+    if (quiet) {
+      console.log(chalk.red(`  ✗ ${serverConfig.label || cfg.host} 部署失败：${err.message.split('\n')[0]}`));
+    } else {
+      console.log(chalk.red(`\n${label}部署失败：${err.message}`));
+      console.log(chalk.gray(`  运行 ${chalk.cyan('deploy-helper rollback')} 可恢复上一个版本`));
+    }
     ssh.dispose();
     return false;
   }
@@ -94,8 +108,8 @@ async function deployToServer(serverConfig) {
 function normalizeConfig(serverConfig) {
   const cfg = { ...serverConfig };
   if (!cfg.appMode) {
-    // 老配置：有 domain / useHttps 或是 static 都视为 web
-    cfg.appMode = (cfg.domain || cfg.useHttps || cfg.projectType === 'static') ? 'web' : 'web';
+    // appMode 与 script/cron 模式是同期引入的，更早的配置只支持 web 部署
+    cfg.appMode = 'web';
   }
   if (cfg.projectType === 'python' && !cfg.pythonEnvManager) {
     cfg.pythonEnvManager = 'pip';
@@ -109,6 +123,9 @@ export async function deployUpdate() {
     console.log(chalk.red('\n没有找到部署配置，请先运行：') + chalk.cyan(' deploy-helper init\n'));
     return;
   }
+
+  // 密码不落盘：按需补齐 SSH / 数据库密码
+  await resolveCredentials(config, { needDatabase: !!config.database });
 
   // 兼容单台和多台服务器配置
   const servers = config.servers
@@ -174,8 +191,12 @@ export async function deployUpdate() {
   const strategy = options.strategy || 'serial';
   const results = [];
 
-  if (servers.length === 1 || strategy === 'parallel') {
-    const outcomes = await Promise.all(servers.map(s => deployToServer(s)));
+  if (servers.length === 1) {
+    results.push(await deployToServer(servers[0], false));
+
+  } else if (strategy === 'parallel') {
+    // 并行：用 quiet 模式，避免多个 spinner 抢同一个 stdout 导致输出错乱
+    const outcomes = await Promise.all(servers.map(s => deployToServer(s, true)));
     results.push(...outcomes);
 
   } else if (strategy === 'serial') {

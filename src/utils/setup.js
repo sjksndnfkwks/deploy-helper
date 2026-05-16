@@ -95,6 +95,13 @@ export function getSetupCommands(config) {
     });
   }
 
+  // apt 在无人值守时可能弹出配置对话框卡住，统一关闭交互
+  for (const s of steps) {
+    if (s.cmd.includes('apt-get')) {
+      s.cmd = `export DEBIAN_FRONTEND=noninteractive; ${s.cmd}`;
+    }
+  }
+
   return steps;
 }
 
@@ -118,7 +125,7 @@ export function getStartCommands(config) {
   if (projectType === 'nodejs') {
     const isNpmCmd = /^npm\s/.test(startCmd);
     const steps = [
-      { label: '安装依赖', cmd: `cd ${remotePath} && npm install --production` },
+      { label: '安装依赖', cmd: `cd ${remotePath} && npm install --omit=dev` },
     ];
 
     if (appMode === 'cron') {
@@ -434,13 +441,16 @@ function getSupervisorConfig({ appName, remotePath, venvCmd, autorestart = 'true
 
 // 生成 Nginx 配置
 export function getNginxConfig(config) {
-  const { domain, port, projectType, remotePath } = config;
+  const { domain, port, projectType, remotePath, staticDir } = config;
 
   if (projectType === 'static') {
+    // staticDir 指向构建产物子目录（如 dist），留空则用项目根
+    const cleanDir = (staticDir || '').trim().replace(/^\/+|\/+$/g, '');
+    const webRoot = cleanDir ? `${remotePath}/${cleanDir}` : remotePath;
     return `server {
     listen 80;
     server_name ${domain};
-    root ${remotePath};
+    root ${webRoot};
     index index.html;
 
     location / {
